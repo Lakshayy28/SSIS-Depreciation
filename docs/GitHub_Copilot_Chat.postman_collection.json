@@ -1,0 +1,148 @@
+{
+  "info": {
+    "name": "GitHub Copilot Chat — SSIS Migration",
+    "description": "Manual testing collection for the GitHub Copilot chat completions endpoint used by the SSIS-to-PySpark migration framework.\n\nSetup:\n1. Add your GitHub token to the 'Bearer' variable in the collection Variables tab.\n2. All requests inherit that token via the Authorization header.\n\nModel discovery:\n- Run 'List Available Models' first to see what your Copilot seat supports.\n- The response 'data[].id' field lists every usable model ID.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://api.githubcopilot.com",
+      "type": "string"
+    },
+    {
+      "key": "bearer_token",
+      "value": "",
+      "type": "string",
+      "description": "Your GitHub personal access token. Generate at https://github.com/settings/tokens — only read:user scope is needed if you have an active Copilot seat."
+    }
+  ],
+  "item": [
+    {
+      "name": "1. List Available Models",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{bearer_token}}"
+          },
+          {
+            "key": "Editor-Version",
+            "value": "vscode/1.90.0"
+          },
+          {
+            "key": "Editor-Plugin-Version",
+            "value": "copilot/1.0.0"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/models",
+          "host": ["{{base_url}}"],
+          "path": ["models"]
+        },
+        "description": "Returns every model ID available to your Copilot seat.\n\nLook for the 'data' array in the response — each element has:\n  - 'id'          → the model ID to use in chat requests (e.g. 'gpt-4o')\n  - 'name'        → human-readable label\n  - 'capabilities.type' → 'chat' | 'embeddings' etc.\n\nOnly models with capabilities.type == 'chat' work with the /chat/completions endpoint.\n\nKnown supported (mid-2026 Copilot seats):\n  gpt-4o          — strongest reasoning, best for complex SQL and script tasks\n  gpt-4o-mini     — faster and cheaper, good for simple SQL and expressions\n\nKnown NOT supported (return 400 model_not_supported):\n  o4-mini, gpt-4.1-mini, o3-mini, gpt-4.5"
+      },
+      "response": []
+    },
+    {
+      "name": "2. Reviewer Agent — SQL Component",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{bearer_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json"
+          },
+          {
+            "key": "Editor-Version",
+            "value": "vscode/1.90.0",
+            "description": "Required by Copilot endpoint — identifies the editor client"
+          },
+          {
+            "key": "Editor-Plugin-Version",
+            "value": "copilot/1.0.0",
+            "description": "Required by Copilot endpoint"
+          },
+          {
+            "key": "Openai-Intent",
+            "value": "conversation-edits",
+            "description": "Required by Copilot endpoint"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0.1,\n  \"max_tokens\": 4096,\n  \"top_p\": 0.95,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a senior PySpark engineer performing a strict code review of auto-generated migration code.\\nYour job is to catch real bugs — especially undefined variables, wrong API calls, and logic errors.\\n\\nReturn ONLY a raw JSON object (no markdown fences, no prose):\\n{\\n  \\\"passed\\\": true/false,\\n  \\\"issues\\\": [\\\"<concrete description of each bug>\\\"],\\n  \\\"corrected_code\\\": \\\"<fixed snippet>\\\" or null\\n}\\n\\nThe snippet runs inside a function that already has these bindings available:\\n  spark       — SparkSession\\n  params      — dict of SSIS parameter values\\n  connections — dict of named connection objects\\n\\n─── MANDATORY checks (apply to every component type) ───────────────────────────\\n\\nUNDEFINED VARIABLES — MUST FAIL:\\n  Any name used in the code that is not:\\n  (a) defined earlier in the same snippet,\\n  (b) one of the pre-bound names (spark, params, connections), or\\n  (c) a Python builtin.\\n  → This is the most common bug. Check every single name carefully.\\n  → If corrected_code fixes it, provide corrected_code; do NOT just pass.\\n\\nWRONG API:\\n  spark.sql(\\\"CALL ...\\\") is invalid — Spark SQL has no CALL statement.\\n  → Must FAIL; provide corrected_code using a connection object instead.\\n\\nSYNTAX:\\n  The snippet must be valid Python. If ast.parse() would raise SyntaxError → FAIL.\\n\\n─── Type-specific checks ────────────────────────────────────────────────────────\\n\\nSQL components (complex_sql, execute_sql):\\n  - Check that the generated code achieves the same data operation as the\\n    original T-SQL (shown in source_context).\\n  - For stored procedure execution: verify the SP name and all @parameters from\\n    the original EXEC statement are correctly referenced. Wrong SP name → FAIL.\\n  - Acceptable patterns for stored proc execution: pyodbc, pymssql, or any\\n    Python DB-API connector. These are valid Python, NOT .NET APIs.\\n  - spark.read.jdbc() is NOT a valid way to execute a stored procedure — it reads\\n    table/query results, it cannot call EXEC.\\n  - An intentional raise NotImplementedError(\\\"...\\\") is acceptable ONLY if the\\n    error message clearly identifies what the engineer must implement.\\n\\nData flow components (source, transform, sink):\\n  - If input_columns is non-empty: all columns must be referenced.\\n  - If output_columns is non-empty: all columns must be produced.\\n\\nScript task components:\\n  - No .NET-specific APIs: Marshal, ComObject, SqlConnection, SqlCommand,\\n    SqlDataReader, System.Data.*, Microsoft.Office.Interop.*.\\n  - Python DB-API connectors (pyodbc, pymssql, psycopg2, cx_Oracle) ARE\\n    valid Python — do NOT flag them as .NET APIs.\\n  - All read_vars consumed; all write_vars assigned.\\n\\n─── Stub / TODO policy ──────────────────────────────────────────────────────────\\n  A stub is acceptable ONLY when it RAISES or has a TODO comment that\\n  explicitly names what the engineer must implement AND has no undefined variables.\\n  A stub with an undefined variable is still a BUG — fix it in corrected_code.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Review the generated Python snippet for correctness.\\n\\nComponent type: complex_sql\\nExpected input columns: none\\nExpected output columns: none\\n\\nOriginal source (what this code must implement):\\n```\\n[T-SQL]\\nEXEC [dbo].[sp_MergeOrderFact] @BatchDate = ?;\\n```\\n\\nGenerated snippet (assume spark, params, connections are already bound):\\n```python\\ndef migrate_stored_procedure():\\n    sp_name = \\\"sp_MergeOrderFact\\\"\\n    batch_date_param = params.get(\\\"BatchDate\\\")\\n\\n    connection_name = \\\"sqlserver_conn\\\"\\n    connection_info = connections[connection_name]\\n\\n    host = connection_info.get(\\\"host\\\")\\n    port = connection_info.get(\\\"port\\\")\\n    database = connection_info.get(\\\"database\\\")\\n    user = connection_info.get(\\\"user\\\", \\\"\\\")\\n    password = connection_info.get(\\\"password\\\", \\\"\\\")\\n\\n    connection_string = f\\\"Driver={ODBC Driver 17 for SQL Server};Server={host},{port};Database={database};UID={user};PWD={password};\\\"\\n\\n    import pyodbc\\n\\n    with pyodbc.connect(connection_string) as conn:\\n        cursor = conn.cursor()\\n        cursor.execute(f\\\"EXEC {sp_name} ?\\\", (batch_date_param,))\\n        conn.commit()\\n```\"\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/chat/completions",
+          "host": ["{{base_url}}"],
+          "path": ["chat", "completions"]
+        },
+        "description": "Reviewer Agent — tests the self-consistency review prompt used in the SSIS migration pipeline.\n\nThe user message contains a realistic example: a generated pyodbc snippet for executing a SQL Server stored procedure (EXEC [dbo].[sp_MergeOrderFact] @BatchDate = ?).\n\nExpected response shape:\n{\n  \"passed\": true | false,\n  \"issues\": [...],\n  \"corrected_code\": \"...\" | null\n}\n\nTo test with a BROKEN snippet (should return passed=false), change the generated code to something like:\n  spark.sql(\"CALL dbo.sp_MergeOrderFact(?)\")\n\nTo test with a CORRECT stub (should return passed=true), use:\n  raise NotImplementedError(\"Implement EXEC dbo.sp_MergeOrderFact manually\")\n\nModel choice:\n  gpt-4o        — used here; best at following the JSON-only output constraint\n  gpt-4o-mini   — faster, slightly more likely to wrap JSON in markdown fences"
+      },
+      "response": []
+    },
+    {
+      "name": "3. Reviewer Agent — Broken Snippet (expect fail)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{bearer_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json"
+          },
+          {
+            "key": "Editor-Version",
+            "value": "vscode/1.90.0"
+          },
+          {
+            "key": "Editor-Plugin-Version",
+            "value": "copilot/1.0.0"
+          },
+          {
+            "key": "Openai-Intent",
+            "value": "conversation-edits"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0.1,\n  \"max_tokens\": 4096,\n  \"top_p\": 0.95,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a senior PySpark engineer performing a strict code review of auto-generated migration code.\\nYour job is to catch real bugs — especially undefined variables, wrong API calls, and logic errors.\\n\\nReturn ONLY a raw JSON object (no markdown fences, no prose):\\n{\\n  \\\"passed\\\": true/false,\\n  \\\"issues\\\": [\\\"<concrete description of each bug>\\\"],\\n  \\\"corrected_code\\\": \\\"<fixed snippet>\\\" or null\\n}\\n\\nThe snippet runs inside a function that already has these bindings available:\\n  spark       — SparkSession\\n  params      — dict of SSIS parameter values\\n  connections — dict of named connection objects\\n\\n─── MANDATORY checks (apply to every component type) ───────────────────────────\\n\\nUNDEFINED VARIABLES — MUST FAIL:\\n  Any name used in the code that is not:\\n  (a) defined earlier in the same snippet,\\n  (b) one of the pre-bound names (spark, params, connections), or\\n  (c) a Python builtin.\\n\\nWRONG API:\\n  spark.sql(\\\"CALL ...\\\") is invalid — Spark SQL has no CALL statement.\\n  → Must FAIL; provide corrected_code using a connection object instead.\\n\\nSYNTAX:\\n  The snippet must be valid Python. If ast.parse() would raise SyntaxError → FAIL.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Review the generated Python snippet for correctness.\\n\\nComponent type: complex_sql\\nExpected input columns: none\\nExpected output columns: none\\n\\nOriginal source (what this code must implement):\\n```\\n[T-SQL]\\nEXEC [dbo].[sp_MergeOrderFact] @BatchDate = ?;\\n```\\n\\nGenerated snippet (assume spark, params, connections are already bound):\\n```python\\n# BAD: uses spark.sql CALL (invalid) and undefined variable\\nspark.sql(f\\\"CALL dbo.sp_MergeOrderFact('{batch_date}')\\\")\\n```\"\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/chat/completions",
+          "host": ["{{base_url}}"],
+          "path": ["chat", "completions"]
+        },
+        "description": "Sends a deliberately broken snippet to the reviewer — should return passed=false with issues.\n\nTwo bugs planted:\n1. spark.sql(\"CALL ...\") — invalid Spark SQL\n2. batch_date is used but never defined\n\nExpected response: { \"passed\": false, \"issues\": [...], \"corrected_code\": \"...\" }"
+      },
+      "response": []
+    }
+  ]
+}
