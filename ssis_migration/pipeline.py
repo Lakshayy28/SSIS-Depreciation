@@ -193,14 +193,26 @@ class MigrationPipeline:
             logger.warning("LLM pipeline failed (continuing without): %s", exc)
 
     def _flag_all_for_llm(self, cir: CIR) -> None:
-        """In pure LLM mode: flag every component and SQL statement."""
+        """In pure LLM mode: flag convertible items for LLM; resolve structural ones immediately."""
         from ssis_migration.cir.models import ConversionStatus, TranspilationStatus
+
+        _STRUCTURAL = ("sequence", "for_loop", "foreach_loop")
+
         for exe in cir.control_flow.execution_tree:
             if exe.sql:
                 exe.sql.transpilation_status = TranspilationStatus.LLM_REQUIRED
-            if exe.type not in ("data_flow",):
+
+            if exe.type in _STRUCTURAL:
+                # Containers have no code body — resolve immediately so they
+                # don't surface as UNCONVERTED in validation.
+                exe.conversion_status = ConversionStatus.DETERMINISTIC
+            elif exe.type == "data_flow":
+                # Data flow executables are resolved via their components below.
+                exe.conversion_status = ConversionStatus.DETERMINISTIC
+            else:
                 exe.conversion_status = ConversionStatus.LLM_REQUIRED
                 cir.flag_for_llm(exe.id)
+
         for df in cir.data_flows:
             for comp in df.components:
                 comp.conversion_status = ConversionStatus.LLM_REQUIRED

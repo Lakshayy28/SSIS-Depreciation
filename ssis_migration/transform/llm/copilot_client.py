@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -29,6 +33,35 @@ _COPILOT_BASE_URL = "https://api.githubcopilot.com"
 _CHAT_ENDPOINT = f"{_COPILOT_BASE_URL}/chat/completions"
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = [1.0, 2.0, 4.0]
+
+# One log file per process, written to /tmp so it's never committed
+_LOG_PATH: Path = Path(tempfile.gettempdir()) / f"ssis_migrate_copilot_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+
+
+def _mask_sensitive(obj: Any) -> Any:
+    """Recursively mask bearer tokens and secrets in dicts/lists/strings."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k.lower() in ("authorization", "github_token", "token"):
+                out[k] = "Bearer ***MASKED***" if str(v).startswith("Bearer ") else "***MASKED***"
+            else:
+                out[k] = _mask_sensitive(v)
+        return out
+    if isinstance(obj, list):
+        return [_mask_sensitive(i) for i in obj]
+    if isinstance(obj, str):
+        # Mask ghp_* / gho_* / github_pat_* tokens that leaked into strings
+        return re.sub(r"gh[pos]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+", "***MASKED***", obj)
+    return obj
+
+
+def _write_log(entry: dict[str, Any]) -> None:
+    try:
+        with _LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass  # Never let logging break the pipeline
 
 
 @dataclass
@@ -87,6 +120,7 @@ class CopilotClient:
         self._model = model or cfg.copilot_model
         self._temperature = cfg.copilot_temperature
         self._max_tokens = cfg.copilot_max_tokens
+        logger.info("Copilot request/response log: %s", _LOG_PATH)
         if not self._token:
             logger.warning(
                 "GITHUB_TOKEN not set — LLM calls will fail. "
@@ -116,6 +150,14 @@ class CopilotClient:
             default_max_tokens=self._max_tokens,
         )
 
+        _write_log({
+            "event": "request",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "endpoint": _CHAT_ENDPOINT,
+            "headers": _mask_sensitive(dict(headers)),
+            "payload": _mask_sensitive(payload),
+        })
+
         last_exc: Exception | None = None
         for attempt, backoff in enumerate(_RETRY_BACKOFF):
             try:
@@ -123,7 +165,21 @@ class CopilotClient:
                     resp = client.post(_CHAT_ENDPOINT, headers=headers, json=payload)
 
                 if resp.status_code == 200:
-                    return self._parse_response(resp.json())
+                    resp_data = resp.json()
+                    _write_log({
+                        "event": "response",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "status": resp.status_code,
+                        "body": _mask_sensitive(resp_data),
+                    })
+                    return self._parse_response(resp_data)
+
+                _write_log({
+                    "event": "response_error",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "status": resp.status_code,
+                    "body": resp.text[:2000],
+                })
 
                 if resp.status_code == 429:
                     retry_after = float(resp.headers.get("retry-after", backoff))
@@ -141,6 +197,7 @@ class CopilotClient:
 
             except httpx.TimeoutException as exc:
                 logger.warning("Timeout on attempt %d: %s", attempt + 1, exc)
+                _write_log({"event": "timeout", "ts": datetime.now(timezone.utc).isoformat(), "attempt": attempt + 1})
                 last_exc = exc
                 time.sleep(backoff)
 

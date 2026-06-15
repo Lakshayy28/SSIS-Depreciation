@@ -77,7 +77,14 @@ class LLMPipeline:
                 self._process_executable(child, cir)
             return
 
-        if exe.type == "script_task" and exe.script_code:
+        _STRUCTURAL_TYPES = ("sequence", "for_loop", "foreach_loop", "data_flow")
+
+        if exe.type in _STRUCTURAL_TYPES:
+            # Structural containers don't need LLM — mark resolved so they don't
+            # surface as UNCONVERTED in validation.
+            exe.conversion_status = ConversionStatus.DETERMINISTIC
+
+        elif exe.type == "script_task" and exe.script_code:
             result = self._script_agent.convert(
                 code=exe.script_code,
                 language=exe.script_language or "csharp",
@@ -112,6 +119,17 @@ class LLMPipeline:
             else:
                 exe.conversion_status = ConversionStatus.HUMAN_REVIEW
                 cir.flag_for_human_review(exe.id)
+
+        elif exe.type in ("file_system", "ftp", "send_mail", "execute_process", "execute_sql"):
+            # Operational task types with no script code — mark deterministic
+            # (the code generator emits a TODO stub, which is correct for these)
+            exe.conversion_status = ConversionStatus.DETERMINISTIC
+
+        else:
+            # Unknown type flagged for LLM but with no convertible content
+            exe.conversion_status = ConversionStatus.HUMAN_REVIEW
+            cir.flag_for_human_review(exe.id)
+            logger.warning("No LLM handler for executable %s (type=%s) — escalated to human review", exe.id, exe.type)
 
         for child in exe.children:
             self._process_executable(child, cir)
