@@ -1,0 +1,49 @@
+"""
+Auto-generated Airflow DAG.
+Source cluster: {{ cluster_name }}
+Packages: {{ packages | length }}
+Generated: {{ generated_at }}
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+from airflow import DAG
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+
+_DEFAULT_ARGS = {
+    "owner": "ssis-migration",
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+    "email_on_failure": True,
+}
+
+with DAG(
+    dag_id="{{ cluster_name | python_identifier }}",
+    default_args=_DEFAULT_ARGS,
+    schedule_interval="{{ schedule_interval | default('0 2 * * *') }}",
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+    tags=["ssis-migration", "{{ wave }}"],
+) as dag:
+
+{% for pkg in packages %}
+    {{ pkg.task_id }} = SparkSubmitOperator(
+        task_id="{{ pkg.task_id }}",
+        application="{{ pkg.application_path }}",
+        name="{{ pkg.name }}",
+        conf={
+            "spark.driver.memory": "{{ pkg.driver_memory | default('4g') }}",
+            "spark.executor.memory": "{{ pkg.executor_memory | default('4g') }}",
+        },
+        env_vars={
+            "GITHUB_TOKEN": "{{ '{{' }} var.value.github_token {{ '}}' }}",
+        },
+    )
+{% endfor %}
+
+    # ── Dependency graph from SSIS precedence constraints ────────────────────
+{% for dep in dependencies %}
+    {{ dep.from_task }} >> {{ dep.to_task }}
+{% endfor %}

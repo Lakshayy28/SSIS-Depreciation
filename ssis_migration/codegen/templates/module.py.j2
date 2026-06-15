@@ -1,0 +1,143 @@
+"""
+Auto-generated PySpark module.
+Source: {{ metadata.source_file }}
+Generated: {{ metadata.parse_timestamp }}
+Complexity: {{ metadata.complexity_score.value }}
+Deterministic coverage: {{ "%.0f%%"|format(conversion_metadata.deterministic_coverage * 100) }}
+LLM-assisted items: {{ conversion_metadata.llm_required_items|length }}
+Human review required: {{ conversion_metadata.human_review_required|length }}
+"""
+
+from __future__ import annotations
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField,
+    StringType, IntegerType, LongType, ShortType, ByteType,
+    FloatType, DoubleType, DecimalType,
+    TimestampType, DateType, BooleanType, BinaryType, NullType,
+)
+from pyspark.sql.window import Window
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# ─── CONNECTION CONFIGURATION ─────────────────────────────────────────────────
+CONNECTIONS: dict[str, dict] = {
+{% for conn in connections %}
+    "{{ conn.id }}": {
+        "name": "{{ conn.name }}",
+        "type": "{{ conn.provider_type }}",
+{% if conn.target_mapping %}
+        "url": "{{ conn.target_mapping.url_template or '' }}",
+        "driver": "{{ conn.target_mapping.driver or '' }}",
+        "format": "{{ conn.target_mapping.format or '' }}",
+{% endif %}
+        "options": {},   # Populated at runtime from environment / config
+    },
+{% endfor %}
+}
+
+
+# ─── PARAMETERS ───────────────────────────────────────────────────────────────
+DEFAULT_PARAMS: dict[str, object] = {
+{% for param in parameters %}
+    "{{ param.name }}": {{ param.default_value|tojson if param.default_value is not none else "None" }},  # {{ param.data_type }}
+{% endfor %}
+}
+
+
+# ─── VARIABLES ────────────────────────────────────────────────────────────────
+_PACKAGE_VARS: dict[str, object] = {
+{% for var in variables %}
+    "{{ var.name }}": {{ var.default_value|tojson if var.default_value is not none else "None" }},
+{% endfor %}
+}
+
+{% for df in data_flows %}
+
+# ─── DATA FLOW: {{ df.name }} ─────────────────────────────────────────────────
+def {{ df.name | python_identifier }}(
+    spark: SparkSession,
+    params: dict | None = None,
+    connections: dict | None = None,
+) -> DataFrame:
+    params = params or DEFAULT_PARAMS
+    connections = connections or CONNECTIONS
+
+{% for comp in df.components %}
+    # ── {{ comp.name }} ({{ comp.subtype }}) ──────────────────────────────────
+{% if comp.pyspark_snippet %}
+{{ comp.pyspark_snippet | indent(4) }}
+{% else %}
+    # TODO: {{ comp.name }} ({{ comp.subtype }}) — {{ comp.conversion_notes or "no snippet generated" }}
+    pass
+{% endif %}
+{% endfor %}
+
+    return df  # noqa: F821 — df is the last DataFrame in the pipeline chain
+{% endfor %}
+
+
+# ─── CONTROL FLOW ─────────────────────────────────────────────────────────────
+def run_package(
+    spark: SparkSession,
+    params: dict | None = None,
+    connections: dict | None = None,
+) -> None:
+    """
+    Package entry point: {{ metadata.source_file }}
+    Execution order is derived from SSIS precedence constraints.
+    """
+    params = params or DEFAULT_PARAMS
+    connections = connections or CONNECTIONS
+
+{% for step_num, exe in control_flow.execution_tree | enumerate %}
+    # Step {{ step_num + 1 }}: {{ exe.name }} [{{ exe.type }}]
+{% if exe.type == "execute_sql" and exe.sql %}
+    logger.info("Executing: {{ exe.name }}")
+{% if exe.sql.transpiled_text %}
+    spark.sql("""
+{{ exe.sql.transpiled_text | indent(4) }}
+    """)
+{% else %}
+    # TODO ({{ exe.sql.transpilation_status.value }}): {{ exe.sql.original_text | truncate(100) }}
+    pass
+{% endif %}
+{% elif exe.type == "data_flow" and exe.data_flow_ref %}
+    logger.info("Executing data flow: {{ exe.name }}")
+{% set df_id = exe.data_flow_ref %}
+{% set df_name = data_flows | selectattr("id", "equalto", df_id) | map(attribute="name") | first | default(exe.name) %}
+    result_df = {{ df_name | python_identifier }}(spark, params, connections)
+{% elif exe.type == "script_task" %}
+    logger.info("Executing script task: {{ exe.name }}")
+{% if exe.pyspark_snippet %}
+{{ exe.pyspark_snippet | indent(4) }}
+{% else %}
+    # TODO ({{ exe.conversion_status.value }}): Script task — {{ exe.conversion_notes or "see human review log" }}
+    pass
+{% endif %}
+{% else %}
+{% if exe.pyspark_snippet %}
+{{ exe.pyspark_snippet | indent(4) }}
+{% else %}
+    # TODO: {{ exe.name }} ({{ exe.type }}) — not yet converted
+    pass
+{% endif %}
+{% endif %}
+{% endfor %}
+
+    logger.info("Package completed: {{ metadata.source_file }}")
+
+
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    _spark = (
+        SparkSession.builder
+        .appName("{{ metadata.source_file | replace('.dtsx', '') }}")
+        .getOrCreate()
+    )
+    run_package(_spark)
+    _spark.stop()

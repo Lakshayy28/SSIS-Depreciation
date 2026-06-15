@@ -1,0 +1,48 @@
+"""
+Auto-generated test scaffold for {{ metadata.source_file }}.
+Fill in test data and expected outputs before running.
+"""
+
+from __future__ import annotations
+
+import pytest
+from pyspark.sql import SparkSession
+
+import {{ module_name }}
+
+
+@pytest.fixture(scope="session")
+def spark():
+    return (
+        SparkSession.builder
+        .master("local[2]")
+        .appName("test_{{ module_name }}")
+        .getOrCreate()
+    )
+
+
+{% for df in data_flows %}
+class Test{{ df.name | pascal_case }}:
+    def test_schema(self, spark):
+        """Verify output schema matches expected columns."""
+        params = {{ module_name }}.DEFAULT_PARAMS.copy()
+        # TODO: provide test connections pointing to test data
+        connections = {{ module_name }}.CONNECTIONS.copy()
+        # result = {{ module_name }}.{{ df.name | python_identifier }}(spark, params, connections)
+        # assert "expected_column" in result.columns
+        pass
+
+    def test_row_count(self, spark):
+        """Verify row count matches SSIS baseline."""
+        pass
+
+    def test_no_nulls_in_key_columns(self, spark):
+        """Verify key columns contain no nulls."""
+        pass
+
+{% endfor %}
+
+class TestRunPackage:
+    def test_package_runs_without_error(self, spark):
+        """Smoke test: package completes without raising exceptions."""
+        pass
