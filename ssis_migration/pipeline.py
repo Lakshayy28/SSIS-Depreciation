@@ -2,12 +2,25 @@
 End-to-end migration pipeline for a single .dtsx file.
 
 Orchestrates: Parse → Deterministic → [LLM] → Generate → Validate → Report
+
+Three conversion modes
+─────────────────────
+  deterministic  Parse + deterministic engine only. No LLM calls. Fast.
+                 Items that need LLM are left as TODO stubs in the output.
+
+  hybrid         Parse + deterministic, then LLM only for LLM_REQUIRED items.
+                 Default. Minimises token cost while maximising coverage.
+
+  llm            Parse only, then LLM for every component and SQL statement,
+                 skipping the deterministic engine entirely. Useful to compare
+                 pure-LLM output against the deterministic+hybrid results.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from ssis_migration.cir.models import CIR, ConversionStatus
@@ -21,14 +34,29 @@ from ssis_migration.validation.static import StaticValidator
 logger = logging.getLogger(__name__)
 
 
+class ConversionMode(str, Enum):
+    DETERMINISTIC = "deterministic"
+    HYBRID = "hybrid"
+    LLM = "llm"
+
+
 @dataclass
 class PipelineConfig:
     output_dir: Path = field(default_factory=lambda: Path("output"))
-    cir_dir: Path | None = None          # Where to save CIR JSON (default: output_dir/cir)
-    enable_llm: bool = True              # Run LLM pipeline for LLM_REQUIRED items
-    github_token: str | None = None      # Override GITHUB_TOKEN env var
-    spark_version: str = "3.3"          # Target PySpark version
-    save_cir: bool = True               # Persist annotated CIR JSON to disk
+    cir_dir: Path | None = None
+    mode: ConversionMode = ConversionMode.HYBRID
+    github_token: str | None = None      # Overrides GITHUB_TOKEN / .env
+    spark_version: str = "3.3"
+    save_cir: bool = True
+
+    # Back-compat alias so existing call sites using enable_llm=False still work
+    @property
+    def enable_llm(self) -> bool:
+        return self.mode != ConversionMode.DETERMINISTIC
+
+    @enable_llm.setter
+    def enable_llm(self, value: bool) -> None:
+        self.mode = ConversionMode.HYBRID if value else ConversionMode.DETERMINISTIC
 
 
 @dataclass
@@ -66,11 +94,12 @@ class MigrationPipeline:
         self._static_validator = StaticValidator(self._config.spark_version)
         self._semantic_validator = SemanticValidator()
 
-    def run(self, dtsx_path: Path) -> PipelineResult:
+    def run(self, dtsx_path: Path, mode: ConversionMode | None = None) -> PipelineResult:
+        mode = mode or self._config.mode
         result = PipelineResult(source_file=str(dtsx_path))
-        logger.info("=== Pipeline start: %s ===", dtsx_path.name)
+        logger.info("=== Pipeline start: %s  mode=%s ===", dtsx_path.name, mode.value)
 
-        # Phase 1: Parse
+        # Phase 1: Parse (always)
         try:
             cir = self._parser.parse(dtsx_path)
             result.cir = cir
@@ -80,37 +109,39 @@ class MigrationPipeline:
             logger.error("Parse failed for %s: %s", dtsx_path, exc)
             return result
 
-        # Phase 2: Deterministic transformation
-        try:
-            cir = self._deterministic.process(cir)
-            logger.info(
-                "[2/5] Deterministic complete: coverage=%.0f%%",
-                cir.conversion_metadata.deterministic_coverage * 100,
-            )
-        except Exception as exc:
-            result.error = f"Deterministic engine failed: {exc}"
-            logger.error("Deterministic engine failed: %s", exc)
-            return result
-
-        if self._config.save_cir:
-            self._save_cir(cir, dtsx_path, stage="annotated")
-
-        # Phase 3: LLM augmentation (optional)
-        if self._config.enable_llm and cir.conversion_metadata.llm_required_items:
+        # Phase 2: Deterministic transformation (skipped in pure LLM mode)
+        if mode != ConversionMode.LLM:
             try:
-                from ssis_migration.transform.llm import LLMPipeline
-                llm_pipeline = LLMPipeline(github_token=self._config.github_token)
-                cir = llm_pipeline.process(cir)
+                cir = self._deterministic.process(cir)
                 logger.info(
-                    "[3/5] LLM complete: human_review=%d",
-                    len(cir.conversion_metadata.human_review_required),
+                    "[2/5] Deterministic complete: coverage=%.0f%%",
+                    cir.conversion_metadata.deterministic_coverage * 100,
                 )
-                if self._config.save_cir:
-                    self._save_cir(cir, dtsx_path, stage="resolved")
             except Exception as exc:
-                logger.warning("LLM pipeline failed (continuing without): %s", exc)
+                result.error = f"Deterministic engine failed: {exc}"
+                logger.error("Deterministic engine failed: %s", exc)
+                return result
+
+            if self._config.save_cir:
+                self._save_cir(cir, dtsx_path, stage="annotated")
         else:
-            logger.info("[3/5] LLM skipped (no LLM_REQUIRED items or disabled)")
+            logger.info("[2/5] Deterministic skipped (mode=llm)")
+
+        # Phase 3: LLM augmentation
+        if mode == ConversionMode.DETERMINISTIC:
+            logger.info("[3/5] LLM skipped (mode=deterministic)")
+
+        elif mode == ConversionMode.HYBRID:
+            # LLM only for items the deterministic engine flagged
+            if cir.conversion_metadata.llm_required_items:
+                self._run_llm(cir, dtsx_path)
+            else:
+                logger.info("[3/5] LLM skipped (0 LLM_REQUIRED items)")
+
+        elif mode == ConversionMode.LLM:
+            # Flag every component and SQL statement for LLM processing
+            self._flag_all_for_llm(cir)
+            self._run_llm(cir, dtsx_path)
 
         # Phase 4: Code generation
         try:
@@ -146,6 +177,35 @@ class MigrationPipeline:
         logger.info("=== Pipeline end: %s — %s ===", dtsx_path.name,
                     "SUCCESS" if result.success else "ISSUES FOUND")
         return result
+
+    def _run_llm(self, cir: CIR, dtsx_path: Path) -> None:
+        try:
+            from ssis_migration.transform.llm import LLMPipeline
+            llm_pipeline = LLMPipeline(github_token=self._config.github_token)
+            llm_pipeline.process(cir)
+            logger.info(
+                "[3/5] LLM complete: human_review=%d",
+                len(cir.conversion_metadata.human_review_required),
+            )
+            if self._config.save_cir:
+                self._save_cir(cir, dtsx_path, stage="resolved")
+        except Exception as exc:
+            logger.warning("LLM pipeline failed (continuing without): %s", exc)
+
+    def _flag_all_for_llm(self, cir: CIR) -> None:
+        """In pure LLM mode: flag every component and SQL statement."""
+        from ssis_migration.cir.models import ConversionStatus, TranspilationStatus
+        for exe in cir.control_flow.execution_tree:
+            if exe.sql:
+                exe.sql.transpilation_status = TranspilationStatus.LLM_REQUIRED
+            if exe.type not in ("data_flow",):
+                exe.conversion_status = ConversionStatus.LLM_REQUIRED
+                cir.flag_for_llm(exe.id)
+        for df in cir.data_flows:
+            for comp in df.components:
+                comp.conversion_status = ConversionStatus.LLM_REQUIRED
+                comp.pyspark_snippet = None
+                cir.flag_for_llm(comp.id)
 
     def _save_cir(self, cir: CIR, dtsx_path: Path, stage: str) -> None:
         cir_dir = self._config.cir_dir or (self._config.output_dir / "cir")

@@ -4,7 +4,10 @@ GitHub Copilot Chat completions client.
 Uses the GitHub Copilot Chat API endpoint with a GitHub token for
 authentication. This is the only LLM provider used in this framework.
 
-Environment variable: GITHUB_TOKEN (required for LLM phases)
+Credentials are loaded from (in priority order):
+  1. Constructor arguments
+  2. GITHUB_TOKEN / COPILOT_MODEL env vars
+  3. .env file in the repo root (loaded via python-dotenv in ssis_migration.config)
 
 The endpoint is the GitHub Copilot chat completions API:
   POST https://api.githubcopilot.com/chat/completions
@@ -14,7 +17,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 _COPILOT_BASE_URL = "https://api.githubcopilot.com"
 _CHAT_ENDPOINT = f"{_COPILOT_BASE_URL}/chat/completions"
-_DEFAULT_MODEL = "gpt-4o"
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = [1.0, 2.0, 4.0]
 
@@ -39,18 +40,20 @@ class Message:
 @dataclass
 class CompletionRequest:
     messages: list[Message]
-    model: str = _DEFAULT_MODEL
-    temperature: float = 0.1       # Low temperature for deterministic code generation
-    max_tokens: int = 4096
+    model: str = ""                # Empty = read from cfg at call time
+    temperature: float = -1.0      # -1 = read from cfg at call time
+    max_tokens: int = -1           # -1 = read from cfg at call time
     top_p: float = 0.95
     extra: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, default_model: str = "gpt-4o-mini",
+               default_temperature: float = 0.1,
+               default_max_tokens: int = 4096) -> dict[str, Any]:
         return {
-            "model": self.model,
+            "model": self.model or default_model,
             "messages": [{"role": m.role, "content": m.content} for m in self.messages],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "temperature": self.temperature if self.temperature >= 0 else default_temperature,
+            "max_tokens": self.max_tokens if self.max_tokens > 0 else default_max_tokens,
             "top_p": self.top_p,
             **self.extra,
         }
@@ -69,17 +72,25 @@ class CopilotClient:
     """
     Thin HTTP client for the GitHub Copilot Chat completions endpoint.
 
-    Authentication: Bearer token via GITHUB_TOKEN env var.
-    Handles retries with exponential backoff for rate-limit and server errors.
+    Authentication: Bearer token from (priority order):
+      1. constructor `token` arg
+      2. GITHUB_TOKEN env var / .env file
+
+    Model and tuning params come from (priority order):
+      1. constructor `model` arg
+      2. COPILOT_MODEL / COPILOT_TEMPERATURE / COPILOT_MAX_TOKENS env vars / .env
     """
 
-    def __init__(self, token: str | None = None, model: str = _DEFAULT_MODEL) -> None:
-        self._token = token or os.environ.get("GITHUB_TOKEN", "")
-        self._model = model
+    def __init__(self, token: str | None = None, model: str | None = None) -> None:
+        from ssis_migration.config import cfg
+        self._token = token or cfg.github_token
+        self._model = model or cfg.copilot_model
+        self._temperature = cfg.copilot_temperature
+        self._max_tokens = cfg.copilot_max_tokens
         if not self._token:
             logger.warning(
                 "GITHUB_TOKEN not set — LLM calls will fail. "
-                "Set GITHUB_TOKEN before running LLM-augmented phases."
+                "Add it to .env or export GITHUB_TOKEN=<token> before running LLM phases."
             )
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
@@ -99,7 +110,11 @@ class CopilotClient:
             "Openai-Intent": "conversation-edits",
         }
 
-        payload = request.to_dict()
+        payload = request.to_dict(
+            default_model=self._model,
+            default_temperature=self._temperature,
+            default_max_tokens=self._max_tokens,
+        )
 
         last_exc: Exception | None = None
         for attempt, backoff in enumerate(_RETRY_BACKOFF):
@@ -153,7 +168,6 @@ class CopilotClient:
     def simple_complete(self, system_prompt: str, user_message: str) -> str:
         """Convenience wrapper returning just the completion text."""
         req = CompletionRequest(
-            model=self._model,
             messages=[
                 Message(role="system", content=system_prompt),
                 Message(role="user", content=user_message),

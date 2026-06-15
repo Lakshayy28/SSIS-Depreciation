@@ -33,9 +33,11 @@ validation_report_*.json
 inventory_report.json
 wave_plan.json
 
-# Environment
+# Environment — ignore actual secrets, keep the example template
 .env
-.env.*
+.env.local
+.env.*.local
+!.env.example
 
 # OS
 .DS_Store
