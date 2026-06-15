@@ -9,6 +9,7 @@ from ssis_migration.parser.ns import (
     ATTR_DATA_TYPE,
     ATTR_NAME,
     ATTR_NAMESPACE,
+    ATTR_OBJECT_NAME,
     ATTR_VALUE,
     DTS,
     DTS_VARIABLE,
@@ -51,7 +52,7 @@ class VariableExtractor:
             return results
 
         for var_el in vars_el.findall(DTS_VARIABLE):
-            name = var_el.get(ATTR_NAME, "")
+            name = var_el.get(ATTR_OBJECT_NAME) or var_el.get(ATTR_NAME, "")
             ns = var_el.get(ATTR_NAMESPACE, "User")
             dtype_raw = var_el.get(ATTR_DATA_TYPE, "8")
             evaluate_as_expr = var_el.get(ATTR_EVALUATE_AS_EXPRESSION, "0") == "1"

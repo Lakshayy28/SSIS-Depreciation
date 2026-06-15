@@ -94,7 +94,7 @@ def run_package(
     params = params or DEFAULT_PARAMS
     connections = connections or CONNECTIONS
 
-{% for step_num, exe in control_flow.execution_tree | enumerate %}
+{% for exe in control_flow.execution_tree %}{% set step_num = loop.index0 %}
     # Step {{ step_num + 1 }}: {{ exe.name }} [{{ exe.type }}]
 {% if exe.type == "execute_sql" and exe.sql %}
     logger.info("Executing: {{ exe.name }}")

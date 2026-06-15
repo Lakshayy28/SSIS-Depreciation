@@ -52,7 +52,11 @@ class DeterministicEngine:
     def _transpile_executable(self, exe, cir: CIR) -> None:
         from ssis_migration.cir.models import TranspilationStatus
 
-        if exe.sql:
+        if exe.type == "data_flow":
+            # Data flow executables are handled by ComponentMapper — mark deterministic
+            exe.conversion_status = ConversionStatus.DETERMINISTIC
+
+        elif exe.sql:
             transpile_sql(exe.sql)
             if exe.sql.transpilation_status == TranspilationStatus.LLM_REQUIRED:
                 cir.flag_for_llm(exe.id)
@@ -60,9 +64,16 @@ class DeterministicEngine:
             else:
                 exe.conversion_status = ConversionStatus.DETERMINISTIC
 
-        if exe.type == "script_task":
+        elif exe.type == "script_task":
             exe.conversion_status = ConversionStatus.LLM_REQUIRED
             cir.flag_for_llm(exe.id)
+
+        elif exe.type in ("sequence", "for_loop", "foreach_loop"):
+            # Containers are deterministic — children handled recursively
+            exe.conversion_status = ConversionStatus.DETERMINISTIC
+
+        elif exe.type in ("file_system", "ftp", "send_mail", "execute_process"):
+            exe.conversion_status = ConversionStatus.DETERMINISTIC
 
         for child in exe.children:
             self._transpile_executable(child, cir)

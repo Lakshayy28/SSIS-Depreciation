@@ -109,8 +109,19 @@ class ControlFlowExtractor:
         return results
 
     def _parse_executable(self, el: etree._Element) -> ControlFlowExecutable | None:
-        raw_type = el.get(ATTR_EXECUTABLE_TYPE, "")
-        cir_type = map_executable_type(raw_type)
+        # SSIS packages use either DTS:ExecutableType or DTS:CreationName
+        raw_type = el.get(ATTR_EXECUTABLE_TYPE, "") or el.get(f"{{{DTS}}}CreationName", "")
+
+        # Fall back to description for bare Sequence Containers
+        if not raw_type:
+            desc = el.get(f"{{{DTS}}}Description", "")
+            if "sequence" in desc.lower():
+                raw_type = "Microsoft.Sequence"
+            elif el.find(DTS_EXECUTABLES) is not None:
+                # Has children but no type — treat as sequence container
+                raw_type = "Microsoft.Sequence"
+
+        cir_type = map_executable_type(raw_type) if raw_type else "sequence"
         name = el.get(_ATTR_NAME, el.get(f"{{{DTS}}}ObjectName", ""))
         exec_id = _gen_id(cir_type[:4])
 

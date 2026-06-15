@@ -8,6 +8,7 @@ from ssis_migration.cir.models import CIRParameter
 from ssis_migration.parser.ns import (
     ATTR_DATA_TYPE,
     ATTR_NAME,
+    ATTR_OBJECT_NAME,
     ATTR_SENSITIVE,
     DTS_PARAMETER,
     DTS_PARAMETERS,
@@ -38,7 +39,7 @@ class ParameterExtractor:
             return params
 
         for el in container.findall(DTS_PARAMETER):
-            name = el.get(ATTR_NAME, "")
+            name = el.get(ATTR_OBJECT_NAME) or el.get(ATTR_NAME, "")
             dtype_raw = el.get(ATTR_DATA_TYPE, "8")
             sensitive = el.get(ATTR_SENSITIVE, "0") == "1"
 

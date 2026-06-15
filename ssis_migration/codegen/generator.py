@@ -51,10 +51,6 @@ def _tojson(value) -> str:
     return json.dumps(value)
 
 
-def _enumerate_filter(iterable):
-    return enumerate(iterable)
-
-
 def _selectattr(iterable, attr, *args):
     """Minimal selectattr implementation for use in templates."""
     for item in iterable:
@@ -98,8 +94,7 @@ class CodeGenerator:
         self._env.filters["truncate"] = _truncate
         self._env.filters["tojson"] = _tojson
 
-        # Register global functions
-        self._env.globals["enumerate"] = _enumerate_filter
+        # no extra globals needed — Jinja2 loop.index0 handles enumeration
 
     def generate(self, cir: CIR) -> dict[str, Path]:
         module_name = _python_identifier(
