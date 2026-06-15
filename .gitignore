@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Tooling
+.ruff_cache/
+.black
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Data / output artefacts (generated — not committed)
+output/
+*.cir.json
+*_cir_annotated.json
+*_cir_resolved.json
+validation_report_*.json
+inventory_report.json
+wave_plan.json
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
