@@ -1,0 +1,336 @@
+<?xml version="1.0"?>
+<DTS:Executable xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+  DTS:refId="Package"
+  DTS:CreationDate="2024-01-15T10:00:00"
+  DTS:CreationName="Microsoft.Package"
+  DTS:DTSID="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
+  DTS:ExecutableType="Microsoft.Package"
+  DTS:ObjectName="ETL_Load_Customers"
+  DTS:PackageType="5"
+  DTS:VersionBuild="1"
+  DTS:VersionGUID="{11111111-2222-3333-4444-555555555555}">
+
+  <!-- Package Parameters -->
+  <DTS:PackageParameters>
+    <DTS:PackageParameter
+      DTS:CreationName=""
+      DTS:DataType="8"
+      DTS:DTSID="{PARAM-0001-0001-0001-000000000001}"
+      DTS:ObjectName="SourceConnectionString">
+      <DTS:Property DTS:Name="ParameterValue">Data Source=SQLPROD01;Initial Catalog=AdventureWorks;Integrated Security=SSPI;</DTS:Property>
+    </DTS:PackageParameter>
+    <DTS:PackageParameter
+      DTS:CreationName=""
+      DTS:DataType="8"
+      DTS:DTSID="{PARAM-0001-0001-0001-000000000002}"
+      DTS:ObjectName="TargetConnectionString">
+      <DTS:Property DTS:Name="ParameterValue">Data Source=SQLPROD01;Initial Catalog=DW_Staging;Integrated Security=SSPI;</DTS:Property>
+    </DTS:PackageParameter>
+    <DTS:PackageParameter
+      DTS:CreationName=""
+      DTS:DataType="7"
+      DTS:DTSID="{PARAM-0001-0001-0001-000000000003}"
+      DTS:ObjectName="IncrementalStartDate">
+      <DTS:Property DTS:Name="ParameterValue">2024-01-01</DTS:Property>
+    </DTS:PackageParameter>
+  </DTS:PackageParameters>
+
+  <!-- Connection Managers -->
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager
+      DTS:refId="Package.ConnectionManagers[OLEDB_Source_AdventureWorks]"
+      DTS:CreationName="OLEDB"
+      DTS:DTSID="{CONN-SRC-0001-0001-000000000001}"
+      DTS:ObjectName="OLEDB_Source_AdventureWorks">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+          DTS:ConnectionString="Data Source=SQLPROD01;Initial Catalog=AdventureWorks;Provider=SQLNCLI11.1;Integrated Security=SSPI;Auto Translate=False;" />
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+    <DTS:ConnectionManager
+      DTS:refId="Package.ConnectionManagers[OLEDB_Dest_DWStaging]"
+      DTS:CreationName="OLEDB"
+      DTS:DTSID="{CONN-DST-0001-0001-000000000001}"
+      DTS:ObjectName="OLEDB_Dest_DWStaging">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+          DTS:ConnectionString="Data Source=SQLPROD01;Initial Catalog=DW_Staging;Provider=SQLNCLI11.1;Integrated Security=SSPI;Auto Translate=False;" />
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+
+  <!-- Variables -->
+  <DTS:Variables>
+    <DTS:Variable
+      DTS:CreationName=""
+      DTS:DTSID="{VAR-0001-0001-0001-000000000001}"
+      DTS:Namespace="User"
+      DTS:ObjectName="RowCount_Source">
+      <DTS:VariableValue DTS:DataType="3">0</DTS:VariableValue>
+    </DTS:Variable>
+    <DTS:Variable
+      DTS:CreationName=""
+      DTS:DTSID="{VAR-0001-0001-0001-000000000002}"
+      DTS:Namespace="User"
+      DTS:ObjectName="RowCount_Destination">
+      <DTS:VariableValue DTS:DataType="3">0</DTS:VariableValue>
+    </DTS:Variable>
+    <DTS:Variable
+      DTS:CreationName=""
+      DTS:DTSID="{VAR-0001-0001-0001-000000000003}"
+      DTS:Namespace="User"
+      DTS:ObjectName="LastModifiedDate">
+      <DTS:VariableValue DTS:DataType="7">2024-01-01T00:00:00</DTS:VariableValue>
+    </DTS:Variable>
+  </DTS:Variables>
+
+  <!-- Executables (Tasks) -->
+  <DTS:Executables>
+
+    <!-- Task 1: Truncate Staging Table -->
+    <DTS:Executable
+      DTS:refId="Package\Truncate Staging Customer"
+      DTS:CreationName="Microsoft.ExecuteSQLTask"
+      DTS:DTSID="{TASK-0001-0001-0001-000000000001}"
+      DTS:ExecutableType="Microsoft.ExecuteSQLTask"
+      DTS:ObjectName="Truncate Staging Customer">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+          xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+          SQLTask:Connection="{CONN-DST-0001-0001-000000000001}"
+          SQLTask:SqlStatementSource="TRUNCATE TABLE [staging].[Customer];" />
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <!-- Task 2: Get Last Modified Date -->
+    <DTS:Executable
+      DTS:refId="Package\Get Last Modified Date"
+      DTS:CreationName="Microsoft.ExecuteSQLTask"
+      DTS:DTSID="{TASK-0001-0001-0001-000000000002}"
+      DTS:ExecutableType="Microsoft.ExecuteSQLTask"
+      DTS:ObjectName="Get Last Modified Date">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+          xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+          SQLTask:Connection="{CONN-DST-0001-0001-000000000001}"
+          SQLTask:ResultType="ResultSetType_SingleRow"
+          SQLTask:SqlStatementSource="SELECT ISNULL(MAX(ModifiedDate), '1900-01-01') AS LastModified FROM [staging].[Customer];">
+          <SQLTask:ResultBinding
+            SQLTask:ResultName="0"
+            SQLTask:DtsVariableName="User::LastModifiedDate" />
+        </SQLTask:SqlTaskData>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <!-- Task 3: Data Flow — Load Customers -->
+    <DTS:Executable
+      DTS:refId="Package\DFT Load Customers"
+      DTS:CreationName="Microsoft.Pipeline"
+      DTS:DTSID="{TASK-0001-0001-0001-000000000003}"
+      DTS:ExecutableType="Microsoft.Pipeline"
+      DTS:ObjectName="DFT Load Customers">
+      <DTS:ObjectData>
+        <pipeline version="1">
+
+          <!-- Source: OLE DB -->
+          <components>
+            <component
+              refId="Package\DFT Load Customers\OLE DB Source"
+              name="OLE DB Source"
+              componentClassID="Microsoft.OLEDBSource">
+              <properties>
+                <property name="SqlCommand">
+                  SELECT
+                    c.CustomerID,
+                    c.CustomerName,
+                    c.Email,
+                    c.Phone,
+                    c.Address,
+                    c.City,
+                    c.State,
+                    c.ZipCode,
+                    c.Country,
+                    c.CustomerType,
+                    c.CreditLimit,
+                    c.IsActive,
+                    c.CreatedDate,
+                    c.ModifiedDate
+                  FROM dbo.Customer c
+                  WHERE c.ModifiedDate > ?
+                </property>
+                <property name="ParameterMapping">@[User::LastModifiedDate]</property>
+              </properties>
+              <outputs>
+                <output name="OLE DB Source Output">
+                  <outputColumns>
+                    <outputColumn name="CustomerID" dataType="i4" />
+                    <outputColumn name="CustomerName" dataType="wstr" length="200" />
+                    <outputColumn name="Email" dataType="wstr" length="255" />
+                    <outputColumn name="Phone" dataType="wstr" length="50" />
+                    <outputColumn name="Address" dataType="wstr" length="500" />
+                    <outputColumn name="City" dataType="wstr" length="100" />
+                    <outputColumn name="State" dataType="wstr" length="50" />
+                    <outputColumn name="ZipCode" dataType="wstr" length="20" />
+                    <outputColumn name="Country" dataType="wstr" length="100" />
+                    <outputColumn name="CustomerType" dataType="wstr" length="50" />
+                    <outputColumn name="CreditLimit" dataType="cy" />
+                    <outputColumn name="IsActive" dataType="bool" />
+                    <outputColumn name="CreatedDate" dataType="dbTimeStamp" />
+                    <outputColumn name="ModifiedDate" dataType="dbTimeStamp" />
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- Derived Column: Add audit fields -->
+            <component
+              refId="Package\DFT Load Customers\Derived Column"
+              name="Add Audit Columns"
+              componentClassID="Microsoft.DerivedColumn">
+              <outputs>
+                <output name="Derived Column Output">
+                  <outputColumns>
+                    <outputColumn name="ETL_LoadDate" dataType="dbTimeStamp"
+                      expression="GETDATE()" />
+                    <outputColumn name="ETL_Source" dataType="wstr" length="100"
+                      expression="&quot;AdventureWorks.dbo.Customer&quot;" />
+                    <outputColumn name="CustomerName_Clean" dataType="wstr" length="200"
+                      expression="TRIM(UPPER(CustomerName))" />
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- Conditional Split: Active vs Inactive -->
+            <component
+              refId="Package\DFT Load Customers\Conditional Split"
+              name="Split Active Inactive"
+              componentClassID="Microsoft.ConditionalSplit">
+              <outputs>
+                <output name="Active Customers">
+                  <properties>
+                    <property name="Expression">IsActive == TRUE</property>
+                  </properties>
+                </output>
+                <output name="Inactive Customers">
+                  <properties>
+                    <property name="Expression">IsActive == FALSE</property>
+                  </properties>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- Lookup: Get existing customer key -->
+            <component
+              refId="Package\DFT Load Customers\Lookup Customer Key"
+              name="Lookup Customer Key"
+              componentClassID="Microsoft.Lookup">
+              <properties>
+                <property name="SqlCommand">
+                  SELECT CustomerID, CustomerKey
+                  FROM dim.Customer
+                </property>
+                <property name="NoMatchBehavior">RedirectToNoMatchOutput</property>
+              </properties>
+              <outputs>
+                <output name="Lookup Match Output" />
+                <output name="Lookup No Match Output" />
+              </outputs>
+            </component>
+
+            <!-- Destination: OLE DB (Staging) -->
+            <component
+              refId="Package\DFT Load Customers\OLE DB Destination"
+              name="OLE DB Destination"
+              componentClassID="Microsoft.OLEDBDestination">
+              <properties>
+                <property name="OpenRowset">[staging].[Customer]</property>
+                <property name="FastLoadOptions">TABLOCK,CHECK_CONSTRAINTS</property>
+                <property name="AccessMode">3</property>
+              </properties>
+            </component>
+
+          </components>
+
+          <!-- Data Flow Paths -->
+          <paths>
+            <path startId="Package\DFT Load Customers\OLE DB Source.OLE DB Source Output"
+                  endId="Package\DFT Load Customers\Derived Column.Input" />
+            <path startId="Package\DFT Load Customers\Derived Column.Derived Column Output"
+                  endId="Package\DFT Load Customers\Conditional Split.Input" />
+            <path startId="Package\DFT Load Customers\Conditional Split.Active Customers"
+                  endId="Package\DFT Load Customers\Lookup Customer Key.Input" />
+            <path startId="Package\DFT Load Customers\Lookup Customer Key.Lookup Match Output"
+                  endId="Package\DFT Load Customers\OLE DB Destination.Input" />
+          </paths>
+        </pipeline>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <!-- Task 4: Execute SP — Merge to Dimension -->
+    <DTS:Executable
+      DTS:refId="Package\Execute Merge Customer Dim"
+      DTS:CreationName="Microsoft.ExecuteSQLTask"
+      DTS:DTSID="{TASK-0001-0001-0001-000000000004}"
+      DTS:ExecutableType="Microsoft.ExecuteSQLTask"
+      DTS:ObjectName="Execute Merge Customer Dim">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+          xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+          SQLTask:Connection="{CONN-DST-0001-0001-000000000001}"
+          SQLTask:SqlStatementSource="EXEC [dbo].[sp_MergeCustomerDim];" />
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <!-- Task 5: Row Count Audit -->
+    <DTS:Executable
+      DTS:refId="Package\Audit Row Counts"
+      DTS:CreationName="Microsoft.ExecuteSQLTask"
+      DTS:DTSID="{TASK-0001-0001-0001-000000000005}"
+      DTS:ExecutableType="Microsoft.ExecuteSQLTask"
+      DTS:ObjectName="Audit Row Counts">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+          xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+          SQLTask:Connection="{CONN-DST-0001-0001-000000000001}"
+          SQLTask:SqlStatementSource="
+            INSERT INTO [audit].[PackageExecution]
+            (PackageName, SourceRowCount, DestRowCount, ExecutionDate, Status)
+            VALUES ('ETL_Load_Customers', ?, ?, GETDATE(), 'Success');">
+          <SQLTask:ParameterBinding
+            SQLTask:ParameterName="0"
+            SQLTask:DtsVariableName="User::RowCount_Source" />
+          <SQLTask:ParameterBinding
+            SQLTask:ParameterName="1"
+            SQLTask:DtsVariableName="User::RowCount_Destination" />
+        </SQLTask:SqlTaskData>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+  </DTS:Executables>
+
+  <!-- Precedence Constraints (Execution Order) -->
+  <DTS:PrecedenceConstraints>
+    <DTS:PrecedenceConstraint
+      DTS:refId="Package.PrecedenceConstraints[Truncate->GetLastModified]"
+      DTS:From="Package\Truncate Staging Customer"
+      DTS:To="Package\Get Last Modified Date"
+      DTS:Value="0" />
+    <DTS:PrecedenceConstraint
+      DTS:refId="Package.PrecedenceConstraints[GetLastModified->DataFlow]"
+      DTS:From="Package\Get Last Modified Date"
+      DTS:To="Package\DFT Load Customers"
+      DTS:Value="0" />
+    <DTS:PrecedenceConstraint
+      DTS:refId="Package.PrecedenceConstraints[DataFlow->MergeDim]"
+      DTS:From="Package\DFT Load Customers"
+      DTS:To="Package\Execute Merge Customer Dim"
+      DTS:Value="0" />
+    <DTS:PrecedenceConstraint
+      DTS:refId="Package.PrecedenceConstraints[MergeDim->Audit]"
+      DTS:From="Package\Execute Merge Customer Dim"
+      DTS:To="Package\Audit Row Counts"
+      DTS:Value="0" />
+  </DTS:PrecedenceConstraints>
+
+</DTS:Executable>

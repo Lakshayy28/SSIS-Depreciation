@@ -105,7 +105,15 @@ class ConnectionExtractor:
         for cm_el in managers_el.findall(DTS_CONNECTION_MANAGER):
             name = cm_el.get(ATTR_OBJECT_NAME) or cm_el.get(ATTR_NAME, "")
             creation_name = cm_el.get(ATTR_CREATION_NAME, "").upper()
-            cs = cm_el.get(ATTR_CONNECTION_STRING, "")
+            # ConnectionString may be on the outer element OR in a nested
+        # DTS:ObjectData/DTS:ConnectionManager element (common in SSIS 2012+)
+        cs = cm_el.get(ATTR_CONNECTION_STRING, "")
+        if not cs:
+            obj_data = cm_el.find(f"{{{DTS}}}ObjectData")
+            if obj_data is not None:
+                inner = obj_data.find(DTS_CONNECTION_MANAGER)
+                if inner is not None:
+                    cs = inner.get(ATTR_CONNECTION_STRING, "")
 
             provider_type = "unknown"
             for prefix, canonical in _PROVIDER_MAP.items():

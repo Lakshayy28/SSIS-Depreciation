@@ -1,0 +1,293 @@
+<?xml version="1.0"?>
+<DTS:Executable xmlns:DTS="www.microsoft.com/SqlServer/Dts"
+  DTS:refId="Package"
+  DTS:CreationDate="2024-01-20T14:30:00"
+  DTS:CreationName="Microsoft.Package"
+  DTS:DTSID="{B2C3D4E5-F6A7-8901-BCDE-F12345678901}"
+  DTS:ExecutableType="Microsoft.Package"
+  DTS:ObjectName="ETL_Load_Orders"
+  DTS:PackageType="5">
+
+  <!-- Connection Managers -->
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager
+      DTS:refId="Package.ConnectionManagers[OLEDB_Source]"
+      DTS:CreationName="OLEDB"
+      DTS:DTSID="{CONN-SRC-0002-0001-000000000001}"
+      DTS:ObjectName="OLEDB_Source">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+          DTS:ConnectionString="Data Source=SQLPROD01;Initial Catalog=AdventureWorks;Provider=SQLNCLI11.1;Integrated Security=SSPI;" />
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+    <DTS:ConnectionManager
+      DTS:refId="Package.ConnectionManagers[OLEDB_Dest]"
+      DTS:CreationName="OLEDB"
+      DTS:DTSID="{CONN-DST-0002-0001-000000000001}"
+      DTS:ObjectName="OLEDB_Dest">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+          DTS:ConnectionString="Data Source=SQLPROD01;Initial Catalog=DW_Staging;Provider=SQLNCLI11.1;Integrated Security=SSPI;" />
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+    <DTS:ConnectionManager
+      DTS:refId="Package.ConnectionManagers[FlatFile_ErrorLog]"
+      DTS:CreationName="FLATFILE"
+      DTS:DTSID="{CONN-FF-0002-0001-000000000001}"
+      DTS:ObjectName="FlatFile_ErrorLog">
+      <DTS:ObjectData>
+        <DTS:ConnectionManager
+          DTS:ConnectionString="\\FileServer\ETL\Logs\OrderErrors.csv"
+          DTS:Format="Delimited"
+          DTS:ColumnNamesInFirstDataRow="True" />
+      </DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+
+  <!-- Variables -->
+  <DTS:Variables>
+    <DTS:Variable DTS:Namespace="User" DTS:ObjectName="BatchDate"
+      DTS:DTSID="{VAR-0002-0001}">
+      <DTS:VariableValue DTS:DataType="7">2024-01-01T00:00:00</DTS:VariableValue>
+    </DTS:Variable>
+    <DTS:Variable DTS:Namespace="User" DTS:ObjectName="ErrorCount"
+      DTS:DTSID="{VAR-0002-0002}">
+      <DTS:VariableValue DTS:DataType="3">0</DTS:VariableValue>
+    </DTS:Variable>
+    <DTS:Variable DTS:Namespace="User" DTS:ObjectName="MaxOrderID"
+      DTS:DTSID="{VAR-0002-0003}">
+      <DTS:VariableValue DTS:DataType="3">0</DTS:VariableValue>
+    </DTS:Variable>
+  </DTS:Variables>
+
+  <DTS:Executables>
+
+    <!-- Sequence Container: Pre-Processing -->
+    <DTS:Executable
+      DTS:refId="Package\SEQ Pre-Processing"
+      DTS:CreationName="STOCK:SEQUENCE"
+      DTS:ObjectName="SEQ Pre-Processing">
+      <DTS:Executables>
+
+        <!-- Get Max OrderID from staging -->
+        <DTS:Executable
+          DTS:refId="Package\SEQ Pre-Processing\Get Max OrderID"
+          DTS:CreationName="Microsoft.ExecuteSQLTask"
+          DTS:ObjectName="Get Max OrderID">
+          <DTS:ObjectData>
+            <SQLTask:SqlTaskData
+              xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+              SQLTask:Connection="{CONN-DST-0002-0001-000000000001}"
+              SQLTask:ResultType="ResultSetType_SingleRow"
+              SQLTask:SqlStatementSource="SELECT ISNULL(MAX(OrderID), 0) AS MaxOrderID FROM [staging].[Orders]">
+              <SQLTask:ResultBinding SQLTask:ResultName="0" SQLTask:DtsVariableName="User::MaxOrderID" />
+            </SQLTask:SqlTaskData>
+          </DTS:ObjectData>
+        </DTS:Executable>
+
+        <!-- Archive previous error log -->
+        <DTS:Executable
+          DTS:refId="Package\SEQ Pre-Processing\Archive Error Log"
+          DTS:CreationName="Microsoft.FileSystemTask"
+          DTS:ObjectName="Archive Error Log">
+          <DTS:ObjectData>
+            <FileSystemTask:FileSystemData
+              xmlns:FileSystemTask="www.microsoft.com/sqlserver/dts/tasks/filesystemtask"
+              FileSystemTask:Operation="MoveFile"
+              FileSystemTask:Source="\\FileServer\ETL\Logs\OrderErrors.csv"
+              FileSystemTask:Destination="\\FileServer\ETL\Archive\OrderErrors_{BatchDate}.csv" />
+          </DTS:ObjectData>
+        </DTS:Executable>
+
+      </DTS:Executables>
+    </DTS:Executable>
+
+    <!-- Data Flow: Load Orders -->
+    <DTS:Executable
+      DTS:refId="Package\DFT Load Orders"
+      DTS:CreationName="Microsoft.Pipeline"
+      DTS:ObjectName="DFT Load Orders">
+      <DTS:ObjectData>
+        <pipeline version="1">
+          <components>
+
+            <!-- Source -->
+            <component name="OLE DB Source" componentClassID="Microsoft.OLEDBSource">
+              <properties>
+                <property name="SqlCommand">
+                  SELECT
+                    o.OrderID,
+                    o.CustomerID,
+                    o.OrderDate,
+                    o.ShipDate,
+                    o.Status,
+                    o.TotalAmount,
+                    o.TaxAmount,
+                    o.FreightAmount,
+                    o.DiscountAmount,
+                    o.NetAmount,
+                    o.PaymentMethod,
+                    o.ShippingMethod,
+                    o.SalesRepID,
+                    o.RegionCode,
+                    o.CurrencyCode,
+                    o.CreatedDate,
+                    o.ModifiedDate
+                  FROM dbo.Orders o
+                  WHERE o.OrderID > ?
+                  ORDER BY o.OrderID
+                </property>
+                <property name="ParameterMapping">@[User::MaxOrderID]</property>
+              </properties>
+              <outputs>
+                <output name="Output">
+                  <outputColumns>
+                    <outputColumn name="OrderID" dataType="i4" />
+                    <outputColumn name="CustomerID" dataType="i4" />
+                    <outputColumn name="OrderDate" dataType="dbDate" />
+                    <outputColumn name="ShipDate" dataType="dbDate" />
+                    <outputColumn name="Status" dataType="wstr" length="20" />
+                    <outputColumn name="TotalAmount" dataType="numeric" precision="18" scale="2" />
+                    <outputColumn name="TaxAmount" dataType="numeric" precision="18" scale="2" />
+                    <outputColumn name="FreightAmount" dataType="numeric" precision="18" scale="2" />
+                    <outputColumn name="DiscountAmount" dataType="numeric" precision="18" scale="2" />
+                    <outputColumn name="NetAmount" dataType="numeric" precision="18" scale="2" />
+                    <outputColumn name="PaymentMethod" dataType="wstr" length="50" />
+                    <outputColumn name="ShippingMethod" dataType="wstr" length="50" />
+                    <outputColumn name="SalesRepID" dataType="i4" />
+                    <outputColumn name="RegionCode" dataType="wstr" length="10" />
+                    <outputColumn name="CurrencyCode" dataType="wstr" length="3" />
+                    <outputColumn name="CreatedDate" dataType="dbTimeStamp" />
+                    <outputColumn name="ModifiedDate" dataType="dbTimeStamp" />
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- Data Conversion -->
+            <component name="Data Conversion" componentClassID="Microsoft.DataConvert">
+              <outputs>
+                <output name="Data Conversion Output">
+                  <outputColumns>
+                    <outputColumn name="TotalAmount_Decimal" dataType="numeric" precision="18" scale="4" />
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- Derived Columns -->
+            <component name="Derived Columns" componentClassID="Microsoft.DerivedColumn">
+              <outputs>
+                <output name="Derived Column Output">
+                  <outputColumns>
+                    <outputColumn name="OrderYear" dataType="i4" expression="YEAR(OrderDate)" />
+                    <outputColumn name="OrderMonth" dataType="i4" expression="MONTH(OrderDate)" />
+                    <outputColumn name="IsHighValue" dataType="bool" expression="TotalAmount > 10000" />
+                    <outputColumn name="ETL_LoadTimestamp" dataType="dbTimeStamp" expression="GETDATE()" />
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- Aggregate: Summary by Region -->
+            <component name="AGG Region Summary" componentClassID="Microsoft.Aggregate">
+              <properties>
+                <property name="KeyScale">Medium</property>
+              </properties>
+              <outputs>
+                <output name="Aggregate Output">
+                  <outputColumns>
+                    <outputColumn name="RegionCode" aggregationType="GroupBy" />
+                    <outputColumn name="OrderCount" aggregationType="CountAll" />
+                    <outputColumn name="TotalRevenue" aggregationType="Sum" sourceColumn="TotalAmount" />
+                    <outputColumn name="AvgOrderValue" aggregationType="Average" sourceColumn="TotalAmount" />
+                  </outputColumns>
+                </output>
+              </outputs>
+            </component>
+
+            <!-- Destination: Staging Orders -->
+            <component name="OLE DB Destination - Orders" componentClassID="Microsoft.OLEDBDestination">
+              <properties>
+                <property name="OpenRowset">[staging].[Orders]</property>
+                <property name="FastLoadOptions">TABLOCK,CHECK_CONSTRAINTS</property>
+              </properties>
+            </component>
+
+            <!-- Destination: Region Summary -->
+            <component name="OLE DB Destination - RegionSummary" componentClassID="Microsoft.OLEDBDestination">
+              <properties>
+                <property name="OpenRowset">[staging].[OrderRegionSummary]</property>
+              </properties>
+            </component>
+
+            <!-- Error Output: Flat File -->
+            <component name="Flat File Destination - Errors" componentClassID="Microsoft.FlatFileDestination">
+              <properties>
+                <property name="ConnectionManager">{CONN-FF-0002-0001-000000000001}</property>
+              </properties>
+            </component>
+
+          </components>
+
+          <paths>
+            <path startId="OLE DB Source.Output" endId="Data Conversion.Input" />
+            <path startId="Data Conversion.Output" endId="Derived Columns.Input" />
+            <path startId="Derived Columns.Output" endId="OLE DB Destination - Orders.Input" />
+            <path startId="Derived Columns.Output" endId="AGG Region Summary.Input" />
+            <path startId="AGG Region Summary.Output" endId="OLE DB Destination - RegionSummary.Input" />
+            <path startId="OLE DB Source.Error Output" endId="Flat File Destination - Errors.Input" />
+          </paths>
+        </pipeline>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <!-- Execute SP: Merge Orders Fact -->
+    <DTS:Executable
+      DTS:refId="Package\Execute Merge Order Fact"
+      DTS:CreationName="Microsoft.ExecuteSQLTask"
+      DTS:ObjectName="Execute Merge Order Fact">
+      <DTS:ObjectData>
+        <SQLTask:SqlTaskData
+          xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask"
+          SQLTask:Connection="{CONN-DST-0002-0001-000000000001}"
+          SQLTask:SqlStatementSource="EXEC [dbo].[sp_MergeOrderFact] @BatchDate = ?;">
+          <SQLTask:ParameterBinding SQLTask:ParameterName="0" SQLTask:DtsVariableName="User::BatchDate" />
+        </SQLTask:SqlTaskData>
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+    <!-- Send Mail on Failure (Event Handler simulation) -->
+    <DTS:Executable
+      DTS:refId="Package\Send Failure Notification"
+      DTS:CreationName="Microsoft.SendMailTask"
+      DTS:ObjectName="Send Failure Notification">
+      <DTS:ObjectData>
+        <SendMailTask:SendMailTaskData
+          xmlns:SendMailTask="www.microsoft.com/sqlserver/dts/tasks/sendmailtask"
+          SendMailTask:ToLine="data-team@company.com"
+          SendMailTask:Subject="ETL_Load_Orders FAILED"
+          SendMailTask:MessageSource="The ETL_Load_Orders package has failed. Check logs." />
+      </DTS:ObjectData>
+    </DTS:Executable>
+
+  </DTS:Executables>
+
+  <!-- Precedence Constraints -->
+  <DTS:PrecedenceConstraints>
+    <DTS:PrecedenceConstraint
+      DTS:From="Package\SEQ Pre-Processing"
+      DTS:To="Package\DFT Load Orders"
+      DTS:Value="0" />
+    <DTS:PrecedenceConstraint
+      DTS:From="Package\DFT Load Orders"
+      DTS:To="Package\Execute Merge Order Fact"
+      DTS:Value="0" />
+    <DTS:PrecedenceConstraint
+      DTS:From="Package\DFT Load Orders"
+      DTS:To="Package\Send Failure Notification"
+      DTS:Value="1"
+      DTS:EvalOp="2" />
+  </DTS:PrecedenceConstraints>
+
+</DTS:Executable>
