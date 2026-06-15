@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,8 +33,10 @@ _CHAT_ENDPOINT = f"{_COPILOT_BASE_URL}/chat/completions"
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = [1.0, 2.0, 4.0]
 
-# One log file per process, written to /tmp so it's never committed
-_LOG_PATH: Path = Path(tempfile.gettempdir()) / f"ssis_migrate_copilot_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+# One JSON-L file per process inside the project so logs are easy to inspect.
+# The directory is git-ignored — logs are never committed.
+_LOG_DIR = Path(__file__).resolve().parents[3] / "copilot_chat_completions"
+_LOG_PATH: Path = _LOG_DIR / f"copilot_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
 
 
 def _mask_sensitive(obj: Any) -> Any:
@@ -58,6 +59,7 @@ def _mask_sensitive(obj: Any) -> Any:
 
 def _write_log(entry: dict[str, Any]) -> None:
     try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
         with _LOG_PATH.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError:

@@ -24,6 +24,9 @@ htmlcov/
 .idea/
 *.swp
 
+# Copilot request/response logs (viewable locally, never committed)
+copilot_chat_completions/
+
 # Data / output artefacts (generated — not committed)
 output/
 *.cir.json
