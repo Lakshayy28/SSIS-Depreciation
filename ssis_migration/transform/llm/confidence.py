@@ -2,16 +2,25 @@
 Confidence scoring for LLM-generated artefacts.
 
 Final score = weighted sum of:
-  - rag_similarity        (0.30) — similarity to validated past conversions
-  - review_passed         (0.30) — ReviewAgent self-consistency pass/fail
-  - static_analysis_ok    (0.20) — Python syntax parses cleanly
-  - source_complexity     (0.10) — inverse of complexity (simpler = higher confidence)
-  - no_risky_patterns     (0.10) — absence of COM interop, dynamic SQL, etc.
+  - review_passed         (0.40) — ReviewAgent self-consistency pass/fail
+  - static_analysis_ok    (0.30) — Python syntax parses cleanly
+  - source_complexity     (0.15) — inverse of complexity (simpler = higher confidence)
+  - no_risky_patterns     (0.15) — absence of COM interop, dynamic SQL exec, etc.
+
+RAG similarity was removed: we have no embedding index yet, so carrying a 0.30
+dead-weight term permanently capped every score at 0.40 (below the 0.50
+accept threshold), making every item land in HUMAN_REVIEW regardless of quality.
 
 Thresholds:
   >= 0.80  → auto-accept
   >= 0.50  → flag for optional review, proceed to validation
   < 0.50   → mandatory human review before proceeding
+
+Score reference (simple package, no risky patterns, valid Python):
+  review pass   → 0.40+0.30+0.15+0.15 = 1.00  (auto-accept)
+  review fail   → 0.00+0.30+0.15+0.15 = 0.60  (optional-review — still proceeds)
+  syntax error  → 0.40+0.00+0.15+0.15 = 0.70  (optional-review)
+  both fail     → 0.00+0.00+0.15+0.15 = 0.30  (mandatory human review)
 """
 
 from __future__ import annotations
@@ -34,7 +43,7 @@ _RISKY_PATTERNS = [
 def compute_confidence(
     generated_code: str,
     review_passed: bool,
-    rag_similarity: float = 0.0,
+    rag_similarity: float = 0.0,   # kept for API compat, ignored until RAG is built
     complexity: ComplexityLevel = ComplexityLevel.MEDIUM,
 ) -> float:
     """Return a confidence score in [0.0, 1.0]."""
@@ -54,11 +63,10 @@ def compute_confidence(
     }.get(complexity, 0.5)
 
     score = (
-        0.30 * rag_similarity
-        + 0.30 * (1.0 if review_passed else 0.0)
-        + 0.20 * (1.0 if static_ok else 0.0)
-        + 0.10 * complexity_score
-        + 0.10 * (1.0 if no_risky else 0.0)
+        0.40 * (1.0 if review_passed else 0.0)
+        + 0.30 * (1.0 if static_ok else 0.0)
+        + 0.15 * complexity_score
+        + 0.15 * (1.0 if no_risky else 0.0)
     )
     return round(min(1.0, max(0.0, score)), 4)
 

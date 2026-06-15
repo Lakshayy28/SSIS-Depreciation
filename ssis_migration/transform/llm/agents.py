@@ -56,20 +56,29 @@ class ReviewAgent:
         component_type: str,
         input_columns: list[str],
         output_columns: list[str],
+        source_context: str = "",
     ) -> tuple[bool, str | None, list[str]]:
         """
         Returns (passed, corrected_code_or_None, issues).
+
+        source_context: the original T-SQL / script / expression that was converted.
+        Used by the reviewer to check semantic equivalence rather than just column presence.
         """
         user_msg = REVIEW_USER.format(
             component_type=component_type,
-            input_columns=", ".join(input_columns),
-            output_columns=", ".join(output_columns),
+            input_columns=", ".join(input_columns) if input_columns else "none",
+            output_columns=", ".join(output_columns) if output_columns else "none",
+            source_context=source_context or "not available",
             generated_code=generated_code,
         )
         raw = self._client.simple_complete(REVIEW_SYSTEM, user_msg)
 
+        # Strip markdown fences around JSON if the model wrapped the output
+        raw_stripped = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
+        raw_stripped = re.sub(r'\s*```$', '', raw_stripped.strip(), flags=re.MULTILINE)
+
         # Extract JSON block from response
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        json_match = re.search(r'\{.*\}', raw_stripped, re.DOTALL)
         if not json_match:
             logger.warning("ReviewAgent returned non-JSON: %.200s", raw)
             return True, None, []   # Assume pass if can't parse
@@ -77,11 +86,14 @@ class ReviewAgent:
         try:
             result = json.loads(json_match.group(0))
         except json.JSONDecodeError:
+            logger.warning("ReviewAgent JSON parse failed: %.200s", raw)
             return True, None, []
 
         passed = result.get("passed", True)
         issues = result.get("issues", [])
         corrected = result.get("corrected_code")
+        if issues:
+            logger.debug("ReviewAgent issues: %s", issues)
 
         return passed, corrected, issues
 
@@ -118,6 +130,7 @@ class ScriptTaskAgent:
                 component_type="script_task",
                 input_columns=read_vars or [],
                 output_columns=write_vars or [],
+                source_context=f"[{language}]\n{code}",
             )
             if passed:
                 confidence = _base_confidence(iteration)
@@ -170,6 +183,7 @@ class ComplexSQLAgent:
                 component_type="complex_sql",
                 input_columns=[],
                 output_columns=[],
+                source_context=f"[T-SQL]\n{sql}",
             )
             if passed:
                 return AgentResult(
@@ -177,13 +191,15 @@ class ComplexSQLAgent:
                     review_passed=True, iterations=iteration,
                 )
             if corrected:
-                generated = corrected
+                generated = _strip_markdown_fences(corrected)
+                logger.debug("ComplexSQLAgent: reviewer provided corrected code on iteration %d", iteration)
             else:
+                logger.debug("ComplexSQLAgent: review failed on iteration %d, issues: %s", iteration, issues)
                 break
 
         return AgentResult(
             success=False, code=generated, confidence=0.3,
-            notes="Complex SQL review failed",
+            notes="Complex SQL review failed after all iterations",
             review_passed=False,
         )
 

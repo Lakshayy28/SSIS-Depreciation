@@ -47,15 +47,26 @@ You are an expert SQL engineer specialising in migrating T-SQL to Apache Spark S
 Convert the provided T-SQL statement to valid Spark SQL or PySpark DataFrame operations.
 
 Rules:
-1. Output ONLY the converted SQL or Python code — no explanation, no markdown fences.
-2. Prefer Spark SQL (spark.sql(\"...\")) for simple statements.
-3. Use PySpark DataFrame API for procedural logic (cursors, temp tables, WHILE loops).
-4. Handle T-SQL-specific functions: ISNULL→COALESCE, GETDATE→CURRENT_TIMESTAMP,
+1. Output ONLY the converted Python/Spark SQL snippet — no explanation, no markdown fences.
+2. Prefer spark.sql("...") for simple SELECT/INSERT/UPDATE/MERGE statements.
+3. Use the PySpark DataFrame API for procedural logic (cursors, temp tables, WHILE loops).
+4. T-SQL function mappings: ISNULL→COALESCE, GETDATE()→CURRENT_TIMESTAMP,
    DATEADD/DATEDIFF→date_add/datediff, TOP N→LIMIT N.
 5. Replace temp tables (#temp) with DataFrame variables or createOrReplaceTempView.
-6. Dynamic SQL must be converted to parameterised f-strings passed to spark.sql().
-7. Do NOT wrap in functions — return a standalone snippet.
-8. The result must be syntactically valid Python/Spark SQL with no errors.
+6. Dynamic SQL → parameterised f-strings passed to spark.sql().
+7. Do NOT wrap in a function definition — return a standalone executable snippet.
+8. The result must be syntactically valid Python with no errors.
+
+Stored procedure handling (EXEC / EXECUTE):
+- Spark cannot call SQL Server stored procedures directly via spark.sql().
+- Generate a Python snippet that (a) documents the stored proc's purpose and
+  (b) provides a runnable JDBC fallback using a standard connection:
+    conn = params.get("connections", {}).get("sqlserver_conn")
+    if conn:
+        conn.execute("EXEC dbo.sp_Name @param1=?", [value])
+- If no connection context is available, raise NotImplementedError with a clear
+  message so the engineer knows exactly what to implement.
+- Never emit spark.sql("CALL ...") — CALL is not valid Spark SQL.
 """
 
 COMPLEX_SQL_USER = """\
@@ -105,22 +116,41 @@ Context — available input columns:
 
 REVIEW_SYSTEM = """\
 You are a senior PySpark engineer performing a self-consistency review of auto-generated code.
-Verify that the generated PySpark code correctly implements the intended SSIS logic.
+Verify that the generated code correctly implements the intended SSIS logic.
 
-Return a JSON object with this schema:
+Return ONLY a JSON object — no markdown, no prose, just the raw JSON:
 {
   "passed": true/false,
   "issues": ["issue1", "issue2"],
   "corrected_code": "..." or null
 }
 
-Checks to perform:
-1. All input columns referenced in SSIS source are read in the PySpark code.
-2. All output columns produced in SSIS are present in the PySpark result.
-3. Data types are compatible between source and target.
-4. No undefined variables or functions are referenced.
-5. The PySpark code is syntactically valid Python.
-6. No obvious logic errors (wrong join direction, missing null handling, etc.).
+Checks — apply only those relevant to the component type:
+
+For DATA FLOW components (source, transform, sink):
+  1. All expected input columns are referenced in the code (skip if input_columns is empty).
+  2. All expected output columns are produced (skip if output_columns is empty).
+  3. Data types are compatible between source and target.
+
+For SQL components (complex_sql, execute_sql):
+  1. Skip column-presence checks entirely — SQL tasks often have no column metadata.
+  2. Check semantic equivalence: does the Spark/PySpark code achieve the same data
+     operation as the original SQL shown in the source_sql field?
+  3. Stored proc calls must NOT use spark.sql("CALL ...") — that is invalid.
+     Accept JDBC fallback or NotImplementedError stubs as correct.
+  4. No undefined variables; syntactically valid Python.
+
+For SCRIPT TASK components:
+  1. Input variables from read_vars are consumed.
+  2. Output variables from write_vars are set.
+  3. No .NET-specific APIs remain (Marshal, ComObject, SqlConnection, etc.).
+  4. Syntactically valid Python.
+
+General (all types):
+  - No undefined variables or missing imports that would cause a NameError.
+  - No obvious logic inversions (wrong join direction, off-by-one, etc.).
+  - If the code is a reasonable stub (NotImplementedError, TODO) for a construct
+    that cannot be auto-converted, mark it as PASSED — stubs are acceptable output.
 """
 
 REVIEW_USER = """\
@@ -129,6 +159,10 @@ Review this auto-generated PySpark code against the original SSIS specification.
 Original SSIS component type: {component_type}
 Expected input columns: {input_columns}
 Expected output columns: {output_columns}
+Original source (T-SQL / script / expression):
+```
+{source_context}
+```
 
 Generated PySpark code:
 ```python
