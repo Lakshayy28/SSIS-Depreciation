@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 
 from ssis_migration.cir.models import ConversionStatus, TranspilationStatus
+from ssis_migration.transform.llm.confidence import _parses_as_python
 from ssis_migration.transform.llm.copilot_client import CopilotClient
 from ssis_migration.transform.llm.prompts import (
     COMPLEX_SQL_SYSTEM,
@@ -166,12 +167,14 @@ class ComplexSQLAgent:
         partial_transpilation: str = "",
         connection_type: str = "oledb",
         jdbc_url_template: str = "jdbc:sqlserver://{host}:{port};databaseName={database}",
+        connection_name: str = "sqlserver_conn",
     ) -> AgentResult:
         user_msg = COMPLEX_SQL_USER.format(
             sql=sql,
             partial_transpilation=partial_transpilation or "none",
             connection_type=connection_type,
             jdbc_url_template=jdbc_url_template,
+            connection_name=connection_name,
         )
 
         generated = self._client.simple_complete(COMPLEX_SQL_SYSTEM, user_msg)
@@ -191,8 +194,24 @@ class ComplexSQLAgent:
                     review_passed=True, iterations=iteration,
                 )
             if corrected:
-                generated = _strip_markdown_fences(corrected)
-                logger.debug("ComplexSQLAgent: reviewer provided corrected code on iteration %d", iteration)
+                corrected = _strip_markdown_fences(corrected)
+                # Accept the reviewer's correction immediately if it parses as
+                # valid Python — avoids re-review loop where the reviewer then
+                # finds hallucinated issues in its own output.
+                if _parses_as_python(corrected):
+                    logger.debug(
+                        "ComplexSQLAgent: accepting reviewer correction on iteration %d (static check passed)",
+                        iteration,
+                    )
+                    return AgentResult(
+                        success=True, code=corrected,
+                        confidence=_base_confidence(iteration) * 0.9,  # slight discount vs review-pass
+                        review_passed=True, iterations=iteration,
+                        notes="Accepted reviewer correction after static validation",
+                    )
+                # Correction itself has syntax errors — use it for the next round
+                generated = corrected
+                logger.debug("ComplexSQLAgent: reviewer correction has syntax errors, retrying iteration %d", iteration)
             else:
                 logger.debug("ComplexSQLAgent: review failed on iteration %d, issues: %s", iteration, issues)
                 break
