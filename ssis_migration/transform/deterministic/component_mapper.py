@@ -1,0 +1,335 @@
+"""
+Component Mapper — converts CIR DataFlow components to PySpark code snippets.
+
+Each mapping is a pure function: CIR component → PySpark code string.
+Items that cannot be deterministically converted set conversion_status to
+LLM_REQUIRED on the component and register with the CIR conversion metadata.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from ssis_migration.cir.models import (
+    CIR,
+    CacheMode,
+    ConversionStatus,
+    DataFlow,
+    DataFlowComponent,
+    JoinType,
+    TranspilationStatus,
+)
+from ssis_migration.transform.deterministic.expression_translator import translate_expression_node
+from ssis_migration.transform.deterministic.sql_transpiler import transpile_sql
+
+logger = logging.getLogger(__name__)
+
+# Join type → PySpark how= argument
+_JOIN_HOW: dict[JoinType, str] = {
+    JoinType.INNER: "inner",
+    JoinType.LEFT_OUTER: "left",
+    JoinType.RIGHT_OUTER: "right",
+    JoinType.FULL_OUTER: "outer",
+}
+
+# Aggregate function → PySpark agg function
+_AGG_FUNC: dict[str, str] = {
+    "count": "F.count",
+    "count_all": "F.count",
+    "count_distinct": "F.countDistinct",
+    "sum": "F.sum",
+    "avg": "F.avg",
+    "min": "F.min",
+    "max": "F.max",
+    "group_by": None,  # group_by is not an aggregation, handled separately
+}
+
+
+class ComponentMapper:
+    """
+    Processes all DataFlow components in a CIR, attaching PySpark code snippets
+    and setting conversion statuses.
+    """
+
+    def process(self, cir: CIR) -> None:
+        for df in cir.data_flows:
+            for comp in df.components:
+                self._map_component(comp, cir, df)
+        self._update_coverage(cir)
+
+    def _map_component(self, comp: DataFlowComponent, cir: CIR, df: DataFlow) -> None:
+        subtype = comp.subtype
+
+        if subtype in ("oledb_source", "ado_net_source"):
+            self._map_source(comp, cir)
+        elif subtype == "flat_file_source":
+            self._map_flat_file_source(comp)
+        elif subtype in ("oledb_destination", "ado_net_destination"):
+            self._map_destination(comp, cir)
+        elif subtype == "flat_file_destination":
+            self._map_flat_file_destination(comp)
+        elif subtype == "derived_column":
+            self._map_derived_column(comp, cir)
+        elif subtype == "conditional_split":
+            self._map_conditional_split(comp, cir)
+        elif subtype == "lookup":
+            self._map_lookup(comp, cir)
+        elif subtype == "merge_join":
+            self._map_merge_join(comp)
+        elif subtype == "aggregate":
+            self._map_aggregate(comp)
+        elif subtype == "sort":
+            self._map_sort(comp)
+        elif subtype == "union_all":
+            self._map_union_all(comp)
+        elif subtype == "multicast":
+            self._map_multicast(comp)
+        elif subtype == "row_count":
+            self._map_row_count(comp)
+        elif subtype == "copy_column":
+            self._map_copy_column(comp)
+        elif subtype == "data_conversion":
+            self._map_data_conversion(comp)
+        elif subtype in ("script_component", "fuzzy_lookup", "fuzzy_grouping",
+                         "term_extraction", "data_mining_query"):
+            self._flag_llm(comp, cir, f"{subtype} has no deterministic equivalent")
+        else:
+            self._flag_llm(comp, cir, f"Unknown component subtype: {subtype}")
+
+    # ── Sources ───────────────────────────────────────────────────────────────
+
+    def _map_source(self, comp: DataFlowComponent, cir: CIR) -> None:
+        conn = self._conn_var(comp.connection_ref)
+        if comp.sql_command:
+            transpile_sql(comp.sql_command)
+            if comp.sql_command.transpilation_status == TranspilationStatus.LLM_REQUIRED:
+                self._flag_llm(comp, cir, "Source SQL requires LLM transpilation")
+                return
+            sql_var = f'source_sql_{comp.id}'
+            snippet = (
+                f'{sql_var} = """\n    {comp.sql_command.transpiled_text}\n"""\n'
+                f'df_{comp.id} = (\n'
+                f'    spark.read.format("jdbc")\n'
+                f'    .option("url", connections["{conn}"]["url"])\n'
+                f'    .option("driver", connections["{conn}"]["driver"])\n'
+                f'    .option("query", {sql_var})\n'
+                f'    .load()\n'
+                f')'
+            )
+        else:
+            # Table-mode access
+            table = comp.table_name or "UNKNOWN_TABLE"
+            snippet = (
+                f'df_{comp.id} = (\n'
+                f'    spark.read.format("jdbc")\n'
+                f'    .option("url", connections["{conn}"]["url"])\n'
+                f'    .option("driver", connections["{conn}"]["driver"])\n'
+                f'    .option("dbtable", "{table}")\n'
+                f'    .load()\n'
+                f')'
+            )
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_flat_file_source(self, comp: DataFlowComponent) -> None:
+        path = comp.file_path or "UNKNOWN_PATH"
+        delim = comp.delimiter or ","
+        header = str(comp.has_header).lower()
+        snippet = (
+            f'df_{comp.id} = (\n'
+            f'    spark.read.format("csv")\n'
+            f'    .option("header", "{header}")\n'
+            f'    .option("sep", "{delim}")\n'
+            f'    .option("inferSchema", "false")\n'
+            f'    .load("{path}")\n'
+            f')'
+        )
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    # ── Destinations ──────────────────────────────────────────────────────────
+
+    def _map_destination(self, comp: DataFlowComponent, cir: CIR) -> None:
+        conn = self._conn_var(comp.connection_ref)
+        table = comp.table_name or "UNKNOWN_TABLE"
+        snippet = (
+            f'(\n'
+            f'    df_input\n'
+            f'    .write.format("jdbc")\n'
+            f'    .option("url", connections["{conn}"]["url"])\n'
+            f'    .option("driver", connections["{conn}"]["driver"])\n'
+            f'    .option("dbtable", "{table}")\n'
+            f'    .mode("append")\n'
+            f'    .save()\n'
+            f')'
+        )
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_flat_file_destination(self, comp: DataFlowComponent) -> None:
+        path = comp.file_path or "UNKNOWN_PATH"
+        snippet = (
+            f'(\n'
+            f'    df_input\n'
+            f'    .write.format("csv")\n'
+            f'    .option("header", "true")\n'
+            f'    .mode("overwrite")\n'
+            f'    .save("{path}")\n'
+            f')'
+        )
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    # ── Transformations ───────────────────────────────────────────────────────
+
+    def _map_derived_column(self, comp: DataFlowComponent, cir: CIR) -> None:
+        lines = ["df = df  # Derived Column"]
+        all_deterministic = True
+        for expr_node in comp.expressions:
+            translate_expression_node(expr_node)
+            if expr_node.translation_status == TranspilationStatus.COMPLETE and expr_node.pyspark_expression:
+                lines.append(
+                    f'df = df.withColumn("{expr_node.output_column}", {expr_node.pyspark_expression})'
+                )
+            else:
+                all_deterministic = False
+                lines.append(
+                    f'# LLM REQUIRED: {expr_node.output_column} = {expr_node.ssis_expression}'
+                )
+                cir.flag_for_llm(f"{comp.id}::expr::{expr_node.output_column}")
+
+        comp.pyspark_snippet = "\n".join(lines)
+        comp.conversion_status = (
+            ConversionStatus.DETERMINISTIC if all_deterministic else ConversionStatus.LLM_REQUIRED
+        )
+
+    def _map_conditional_split(self, comp: DataFlowComponent, cir: CIR) -> None:
+        lines = ["# Conditional Split"]
+        all_deterministic = True
+        for expr_node in comp.expressions:
+            translate_expression_node(expr_node)
+            if expr_node.translation_status == TranspilationStatus.COMPLETE and expr_node.pyspark_expression:
+                safe = expr_node.output_column.lower().replace(" ", "_")
+                lines.append(f'df_{safe} = df.filter({expr_node.pyspark_expression})')
+            else:
+                all_deterministic = False
+                lines.append(f'# LLM REQUIRED: split on {expr_node.ssis_expression}')
+                cir.flag_for_llm(f"{comp.id}::split::{expr_node.output_column}")
+
+        comp.pyspark_snippet = "\n".join(lines)
+        comp.conversion_status = (
+            ConversionStatus.DETERMINISTIC if all_deterministic else ConversionStatus.LLM_REQUIRED
+        )
+
+    def _map_lookup(self, comp: DataFlowComponent, cir: CIR) -> None:
+        conn = self._conn_var(comp.connection_ref)
+        join_keys = [f'"{j.input}"' for j in comp.join_columns]
+        join_cols_str = f"[{', '.join(join_keys)}]" if join_keys else '"key"'
+
+        lookup_load = ""
+        if comp.lookup_sql:
+            lookup_load = (
+                f'lookup_df_{comp.id} = (\n'
+                f'    spark.read.format("jdbc")\n'
+                f'    .option("url", connections["{conn}"]["url"])\n'
+                f'    .option("query", """{comp.lookup_sql}""")\n'
+                f'    .load()\n'
+                f')'
+            )
+
+        how = "left"  # Lookup in SSIS is a left join equivalent
+        broadcast = "F.broadcast(lookup_df)" if comp.cache_mode == CacheMode.NONE else "lookup_df"
+        snippet = (
+            f'{lookup_load}\n'
+            f'df = df.join({broadcast}_{comp.id}, on={join_cols_str}, how="{how}")'
+        )
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_merge_join(self, comp: DataFlowComponent) -> None:
+        how = _JOIN_HOW.get(comp.join_type or JoinType.INNER, "inner")
+        keys = [f'"{k}"' for k in comp.join_key_columns]
+        keys_str = f"[{', '.join(keys)}]" if keys else '"key"'
+        snippet = f'df = df_left.join(df_right, on={keys_str}, how="{how}")'
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_aggregate(self, comp: DataFlowComponent) -> None:
+        group_cols = [f'"{c}"' for c in comp.group_by_columns]
+        agg_calls = []
+        for agg in comp.aggregations:
+            func = _AGG_FUNC.get(agg.get("function", ""), "F.count")
+            col = agg.get("column", "col")
+            if func:
+                agg_calls.append(f'{func}("{col}").alias("{col}")')
+
+        group_str = f"[{', '.join(group_cols)}]" if group_cols else ""
+        agg_str = ", ".join(agg_calls) if agg_calls else 'F.count("*").alias("count")'
+        snippet = f'df = df.groupBy({group_str}).agg({agg_str})'
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_sort(self, comp: DataFlowComponent) -> None:
+        # Sort columns are in output_columns; SSIS sort order is in properties
+        cols = [f'"{c.name}"' for c in comp.output_columns[:3]] or ['"col"']
+        snippet = f'df = df.orderBy({", ".join(cols)})'
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_union_all(self, comp: DataFlowComponent) -> None:
+        snippet = 'df = df1.unionByName(df2, allowMissingColumns=True)'
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_multicast(self, comp: DataFlowComponent) -> None:
+        snippet = '# Multicast: df is referenced by multiple downstream components\ndf_copy = df'
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_row_count(self, comp: DataFlowComponent) -> None:
+        snippet = f'row_count_{comp.id} = df.count()'
+        comp.pyspark_snippet = snippet
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_copy_column(self, comp: DataFlowComponent) -> None:
+        lines = []
+        for mapping in comp.column_mappings:
+            lines.append(f'df = df.withColumn("{mapping.destination}", F.col("{mapping.source}"))')
+        comp.pyspark_snippet = "\n".join(lines) or "# Copy Column (no mappings)"
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    def _map_data_conversion(self, comp: DataFlowComponent) -> None:
+        lines = []
+        for col in comp.output_columns:
+            if col.pyspark_type:
+                lines.append(
+                    f'df = df.withColumn("{col.name}", F.col("{col.name}").cast({col.pyspark_type}()))'
+                )
+        comp.pyspark_snippet = "\n".join(lines) or "# Data Conversion"
+        comp.conversion_status = ConversionStatus.DETERMINISTIC
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _flag_llm(self, comp: DataFlowComponent, cir: CIR, reason: str) -> None:
+        comp.conversion_status = ConversionStatus.LLM_REQUIRED
+        comp.conversion_notes = reason
+        cir.flag_for_llm(comp.id)
+        logger.debug("Component %s flagged for LLM: %s", comp.id, reason)
+
+    def _conn_var(self, conn_ref: str | None) -> str:
+        if not conn_ref:
+            return "default"
+        import re
+        return re.sub(r'[^a-z0-9]+', '_', (conn_ref or "").lower()).strip('_')
+
+    def _update_coverage(self, cir: CIR) -> None:
+        total = sum(len(df.components) for df in cir.data_flows)
+        if total == 0:
+            cir.conversion_metadata.deterministic_coverage = 1.0
+            return
+        deterministic = sum(
+            1 for df in cir.data_flows
+            for comp in df.components
+            if comp.conversion_status == ConversionStatus.DETERMINISTIC
+        )
+        cir.conversion_metadata.deterministic_coverage = deterministic / total
