@@ -46,12 +46,13 @@ class Config:
         default_factory=lambda: os.environ.get("GITHUB_TOKEN", "")
     )
     copilot_model: str = field(
-        default_factory=lambda: os.environ.get("COPILOT_MODEL", "gpt-4o-mini")
+        default_factory=lambda: os.environ.get("COPILOT_MODEL", "claude-haiku-4.5")
     )
-    # Reviewer always uses a stronger model than generation by default.
-    # Override with COPILOT_REVIEWER_MODEL in .env.
+    # Reviewer model. claude-haiku-4.5 has proven stronger than gpt-4o for this
+    # review/critique task, so it is the default for BOTH generation and review.
+    # Override with COPILOT_REVIEWER_MODEL in .env to use a different reviewer.
     copilot_reviewer_model: str = field(
-        default_factory=lambda: os.environ.get("COPILOT_REVIEWER_MODEL", "gpt-4o")
+        default_factory=lambda: os.environ.get("COPILOT_REVIEWER_MODEL", "claude-haiku-4.5")
     )
     copilot_temperature: float = field(
         default_factory=lambda: float(os.environ.get("COPILOT_TEMPERATURE", "0.1"))
