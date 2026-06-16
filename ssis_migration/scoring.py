@@ -107,9 +107,17 @@ def count_dtsx_elements(dtsx_path: Path | str) -> dict[str, int]:
         return {k: 0 for k in _COVERAGE_WEIGHTS}
 
     root = tree.getroot()
+
+    # The data-flow pipeline XML is embedded under DTS:ObjectData and its
+    # <component> elements are UNPREFIXED (no namespace) — so match by local
+    # name regardless of namespace rather than assuming the pipeline NS.
+    dataflow_components = sum(
+        1 for e in root.iter()
+        if isinstance(e.tag, str) and e.tag.rsplit("}", 1)[-1] == "component"
+    )
     return {
         "executables": len(root.findall(f".//{ns.DTS_EXECUTABLE}")),
-        "dataflow_components": len(root.findall(f".//{{{ns.PIPELINE}}}component")),
+        "dataflow_components": dataflow_components,
         "connections": len(root.findall(f".//{ns.DTS_CONNECTION_MANAGER}")),
         "parameters": len(root.findall(f".//{ns.DTS_PARAMETER}")),
         "variables": len(root.findall(f".//{ns.DTS_VARIABLE}")),

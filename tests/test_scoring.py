@@ -155,3 +155,11 @@ def test_counts_on_real_sample():
     assert 0.0 <= cov <= 1.0
     assert set(detail) == {"executables", "dataflow_components", "connections",
                            "parameters", "variables"}
+
+
+@pytest.mark.skipif(not (SAMPLES / "ETL_Load_Customers.dtsx").exists(), reason="sample missing")
+def test_dataflow_components_counted_despite_unprefixed_namespace():
+    # Regression: data-flow <component> elements are unprefixed in DTSX; the
+    # counter must still find them (it previously assumed the pipeline NS → 0).
+    counts = count_dtsx_elements(SAMPLES / "ETL_Load_Customers.dtsx")
+    assert counts["dataflow_components"] >= 1
