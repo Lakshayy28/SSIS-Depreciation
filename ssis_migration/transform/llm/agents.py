@@ -1,12 +1,16 @@
 """
-LLM agent implementations for the four categories that require LLM assistance:
-  1. Script Tasks (C#/VB.NET)
-  2. Complex SQL (procedural T-SQL)
-  3. SSIS Expressions beyond the deterministic map
-  4. Unknown / third-party components
+LLM agent implementations.
 
-Each agent uses the GitHub Copilot Chat endpoint via CopilotClient and applies
-a ReviewAgent self-consistency pass (up to 3 iterations) before accepting.
+Design: every agent uses a Generate → Review → Regenerate loop.
+When the reviewer finds issues it returns them as a list; the GENERATOR is then
+called again with those issues appended to its user prompt so it can reason
+about and fix its own output.  The reviewer never patches code — it only judges.
+
+Agents:
+  ScriptTaskAgent       — C#/VB.NET Script Tasks → Python function
+  ComplexSQLAgent       — procedural T-SQL → Spark SQL / PySpark
+  ExpressionAgent       — SSIS expression language → PySpark column expression
+  FunctionalValidatorAgent — full-package LLM equivalence check vs CIR
 """
 
 from __future__ import annotations
@@ -24,6 +28,10 @@ from ssis_migration.transform.llm.prompts import (
     COMPLEX_SQL_USER,
     EXPRESSION_SYSTEM,
     EXPRESSION_USER,
+    FUNCTIONAL_CONTEXT_SUFFIX,
+    FUNCTIONAL_VALIDATOR_SYSTEM,
+    FUNCTIONAL_VALIDATOR_USER,
+    REGEN_SUFFIX,
     REVIEW_SYSTEM,
     REVIEW_USER,
     SCRIPT_TASK_SYSTEM,
@@ -31,8 +39,6 @@ from ssis_migration.transform.llm.prompts import (
 )
 
 logger = logging.getLogger(__name__)
-
-_MAX_REVIEW_ITERATIONS = 3
 
 
 @dataclass
@@ -45,11 +51,26 @@ class AgentResult:
     iterations: int = 1
 
 
-class ReviewAgent:
-    """Self-consistency reviewer — validates LLM-generated code against spec."""
+@dataclass
+class FunctionalValidationResult:
+    passed: bool
+    equivalence_score: float    # 0.0–1.0
+    critical_issues: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
-    def __init__(self, client: CopilotClient) -> None:
+
+# ── ReviewAgent ───────────────────────────────────────────────────────────────
+
+class ReviewAgent:
+    """
+    Strict code reviewer.  Returns issues as a list for the generator to fix.
+    Never patches code itself — corrected_code is always set to null in prompts.
+    Uses a separate (stronger) model than the generator.
+    """
+
+    def __init__(self, client: CopilotClient, reviewer_model: str | None = None) -> None:
         self._client = client
+        self._reviewer_model = reviewer_model  # None → client default
 
     def review(
         self,
@@ -58,53 +79,63 @@ class ReviewAgent:
         input_columns: list[str],
         output_columns: list[str],
         source_context: str = "",
-    ) -> tuple[bool, str | None, list[str]]:
-        """
-        Returns (passed, corrected_code_or_None, issues).
-
-        source_context: the original T-SQL / script / expression that was converted.
-        Used by the reviewer to check semantic equivalence rather than just column presence.
-        """
+        spark_version: str = "3.3",
+    ) -> tuple[bool, list[str]]:
+        """Returns (passed, issues).  Never returns corrected code."""
+        system = REVIEW_SYSTEM.format(spark_version=spark_version)
         user_msg = REVIEW_USER.format(
+            spark_version=spark_version,
             component_type=component_type,
             input_columns=", ".join(input_columns) if input_columns else "none",
             output_columns=", ".join(output_columns) if output_columns else "none",
             source_context=source_context or "not available",
             generated_code=generated_code,
         )
-        raw = self._client.simple_complete(REVIEW_SYSTEM, user_msg)
 
-        # Strip markdown fences around JSON if the model wrapped the output
-        raw_stripped = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
-        raw_stripped = re.sub(r'\s*```$', '', raw_stripped.strip(), flags=re.MULTILINE)
+        # Use reviewer model if specified, otherwise fall back to client default
+        if self._reviewer_model:
+            raw = self._client.simple_complete(system, user_msg, model=self._reviewer_model)
+        else:
+            raw = self._client.simple_complete(system, user_msg)
 
-        # Extract JSON block from response
-        json_match = re.search(r'\{.*\}', raw_stripped, re.DOTALL)
+        # Strip any accidental markdown fences around the JSON
+        raw = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
+        raw = re.sub(r'\s*```$', '', raw.strip(), flags=re.MULTILINE)
+
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
             logger.warning("ReviewAgent returned non-JSON: %.200s", raw)
-            return True, None, []   # Assume pass if can't parse
+            return True, []  # Assume pass if unparseable
 
         try:
             result = json.loads(json_match.group(0))
         except json.JSONDecodeError:
             logger.warning("ReviewAgent JSON parse failed: %.200s", raw)
-            return True, None, []
+            return True, []
 
         passed = result.get("passed", True)
         issues = result.get("issues", [])
-        corrected = result.get("corrected_code")
         if issues:
-            logger.debug("ReviewAgent issues: %s", issues)
+            logger.debug("ReviewAgent issues (%s): %s", component_type, issues)
+        return passed, issues
 
-        return passed, corrected, issues
 
+# ── ScriptTaskAgent ───────────────────────────────────────────────────────────
 
 class ScriptTaskAgent:
     """Converts C# or VB.NET Script Task code to a Python function."""
 
-    def __init__(self, client: CopilotClient, review_agent: ReviewAgent) -> None:
+    def __init__(
+        self,
+        client: CopilotClient,
+        review_agent: ReviewAgent,
+        max_iterations: int = 4,
+        spark_version: str = "3.3",
+    ) -> None:
         self._client = client
         self._reviewer = review_agent
+        self._max_iterations = max_iterations
+        self._spark_version = spark_version
 
     def convert(
         self,
@@ -113,53 +144,76 @@ class ScriptTaskAgent:
         referenced_assemblies: list[str] | None = None,
         read_vars: list[str] | None = None,
         write_vars: list[str] | None = None,
+        functional_context: list[str] | None = None,
     ) -> AgentResult:
-        user_msg = SCRIPT_TASK_USER.format(
+        system = SCRIPT_TASK_SYSTEM.format(spark_version=self._spark_version)
+        base_user = SCRIPT_TASK_USER.format(
+            spark_version=self._spark_version,
             language=language,
             assemblies=", ".join(referenced_assemblies or []) or "none",
             read_vars=", ".join(read_vars or []) or "none",
             write_vars=", ".join(write_vars or []) or "none",
             code=code,
         )
+        if functional_context:
+            base_user += FUNCTIONAL_CONTEXT_SUFFIX.format(
+                issues="\n".join(f"- {i}" for i in functional_context)
+            )
 
-        generated = self._client.simple_complete(SCRIPT_TASK_SYSTEM, user_msg)
-        generated = _strip_markdown_fences(generated)
+        user_msg = base_user
+        for iteration in range(1, self._max_iterations + 1):
+            generated = _strip_markdown_fences(
+                self._client.simple_complete(system, user_msg)
+            )
 
-        for iteration in range(1, _MAX_REVIEW_ITERATIONS + 1):
-            passed, corrected, issues = self._reviewer.review(
+            passed, issues = self._reviewer.review(
                 generated,
                 component_type="script_task",
                 input_columns=read_vars or [],
                 output_columns=write_vars or [],
                 source_context=f"[{language}]\n{code}",
+                spark_version=self._spark_version,
             )
             if passed:
-                confidence = _base_confidence(iteration)
                 return AgentResult(
-                    success=True, code=generated, confidence=confidence,
+                    success=True, code=generated,
+                    confidence=_base_confidence(iteration),
                     review_passed=True, iterations=iteration,
                 )
-            if corrected:
-                generated = corrected
-                logger.debug("ScriptTaskAgent: review iteration %d corrected code", iteration)
-            else:
-                logger.warning("ScriptTaskAgent: review failed, issues: %s", issues)
-                break
 
-        # Escalate to human review
+            logger.debug(
+                "ScriptTaskAgent iteration %d/%d failed review: %s",
+                iteration, self._max_iterations, issues,
+            )
+            if iteration < self._max_iterations:
+                # Feed issues back to generator — regenerate, do not patch
+                user_msg = base_user + REGEN_SUFFIX.format(
+                    issues="\n".join(f"- {i}" for i in issues)
+                )
+
         return AgentResult(
             success=False, code=generated, confidence=0.3,
-            notes=f"Review failed after {_MAX_REVIEW_ITERATIONS} iterations",
-            review_passed=False, iterations=_MAX_REVIEW_ITERATIONS,
+            notes=f"Review-regen loop exhausted after {self._max_iterations} iterations",
+            review_passed=False, iterations=self._max_iterations,
         )
 
+
+# ── ComplexSQLAgent ───────────────────────────────────────────────────────────
 
 class ComplexSQLAgent:
     """Converts procedural T-SQL to Spark SQL / PySpark DataFrame operations."""
 
-    def __init__(self, client: CopilotClient, review_agent: ReviewAgent) -> None:
+    def __init__(
+        self,
+        client: CopilotClient,
+        review_agent: ReviewAgent,
+        max_iterations: int = 4,
+        spark_version: str = "3.3",
+    ) -> None:
         self._client = client
         self._reviewer = review_agent
+        self._max_iterations = max_iterations
+        self._spark_version = spark_version
 
     def convert(
         self,
@@ -168,66 +222,71 @@ class ComplexSQLAgent:
         connection_type: str = "oledb",
         jdbc_url_template: str = "jdbc:sqlserver://{host}:{port};databaseName={database}",
         connection_name: str = "sqlserver_conn",
+        functional_context: list[str] | None = None,
     ) -> AgentResult:
-        user_msg = COMPLEX_SQL_USER.format(
+        system = COMPLEX_SQL_SYSTEM.format(
+            spark_version=self._spark_version,
+            connection_name=connection_name,
+        )
+        base_user = COMPLEX_SQL_USER.format(
+            spark_version=self._spark_version,
             sql=sql,
             partial_transpilation=partial_transpilation or "none",
             connection_type=connection_type,
             jdbc_url_template=jdbc_url_template,
             connection_name=connection_name,
         )
+        if functional_context:
+            base_user += FUNCTIONAL_CONTEXT_SUFFIX.format(
+                issues="\n".join(f"- {i}" for i in functional_context)
+            )
 
-        generated = self._client.simple_complete(COMPLEX_SQL_SYSTEM, user_msg)
-        generated = _strip_markdown_fences(generated)
+        user_msg = base_user
+        generated = ""
+        for iteration in range(1, self._max_iterations + 1):
+            generated = _strip_markdown_fences(
+                self._client.simple_complete(system, user_msg)
+            )
 
-        for iteration in range(1, _MAX_REVIEW_ITERATIONS + 1):
-            passed, corrected, issues = self._reviewer.review(
+            passed, issues = self._reviewer.review(
                 generated,
                 component_type="complex_sql",
                 input_columns=[],
                 output_columns=[],
                 source_context=f"[T-SQL]\n{sql}",
+                spark_version=self._spark_version,
             )
             if passed:
                 return AgentResult(
-                    success=True, code=generated, confidence=_base_confidence(iteration),
+                    success=True, code=generated,
+                    confidence=_base_confidence(iteration),
                     review_passed=True, iterations=iteration,
                 )
-            if corrected:
-                corrected = _strip_markdown_fences(corrected)
-                # Accept the reviewer's correction immediately if it parses as
-                # valid Python — avoids re-review loop where the reviewer then
-                # finds hallucinated issues in its own output.
-                if _parses_as_python(corrected):
-                    logger.debug(
-                        "ComplexSQLAgent: accepting reviewer correction on iteration %d (static check passed)",
-                        iteration,
-                    )
-                    return AgentResult(
-                        success=True, code=corrected,
-                        confidence=_base_confidence(iteration) * 0.9,  # slight discount vs review-pass
-                        review_passed=True, iterations=iteration,
-                        notes="Accepted reviewer correction after static validation",
-                    )
-                # Correction itself has syntax errors — use it for the next round
-                generated = corrected
-                logger.debug("ComplexSQLAgent: reviewer correction has syntax errors, retrying iteration %d", iteration)
-            else:
-                logger.debug("ComplexSQLAgent: review failed on iteration %d, issues: %s", iteration, issues)
-                break
+
+            logger.debug(
+                "ComplexSQLAgent iteration %d/%d failed review: %s",
+                iteration, self._max_iterations, issues,
+            )
+            if iteration < self._max_iterations:
+                user_msg = base_user + REGEN_SUFFIX.format(
+                    issues="\n".join(f"- {i}" for i in issues)
+                )
 
         return AgentResult(
             success=False, code=generated, confidence=0.3,
-            notes="Complex SQL review failed after all iterations",
-            review_passed=False,
+            notes=f"Review-regen loop exhausted after {self._max_iterations} iterations",
+            review_passed=False, iterations=self._max_iterations,
         )
 
+
+# ── ExpressionAgent ───────────────────────────────────────────────────────────
 
 class ExpressionAgent:
     """Converts SSIS expressions that exceeded the deterministic map."""
 
-    def __init__(self, client: CopilotClient) -> None:
+    def __init__(self, client: CopilotClient, spark_version: str = "3.3") -> None:
         self._client = client
+        self._spark_version = spark_version
 
     def convert(
         self,
@@ -235,28 +294,88 @@ class ExpressionAgent:
         output_column: str,
         input_columns: list[str] | None = None,
     ) -> AgentResult:
+        system = EXPRESSION_SYSTEM.format(spark_version=self._spark_version)
         user_msg = EXPRESSION_USER.format(
+            spark_version=self._spark_version,
             ssis_expression=ssis_expression,
             output_column=output_column,
             input_columns=", ".join(input_columns or []) or "unknown",
         )
-        generated = self._client.simple_complete(EXPRESSION_SYSTEM, user_msg)
+        generated = self._client.simple_complete(system, user_msg)
         generated = _strip_markdown_fences(generated).strip()
 
-        # Basic validation: must start with F. or be a valid expression
         if generated and (generated.startswith("F.") or generated.startswith("(")):
             return AgentResult(success=True, code=generated, confidence=0.75, review_passed=True)
 
         return AgentResult(
             success=False, code=generated, confidence=0.4,
-            notes="Expression output did not match expected PySpark pattern",
+            notes="Expression output did not start with F. or ( — may be wrong format",
+        )
+
+
+# ── FunctionalValidatorAgent ──────────────────────────────────────────────────
+
+class FunctionalValidatorAgent:
+    """
+    Compares the generated PySpark module against the CIR (parsed SSIS logic)
+    and returns a structured equivalence assessment.
+
+    This is the package-level gate: if it fails, all LLM-converted items are
+    re-generated with the critical issues as additional context.
+    """
+
+    def __init__(self, client: CopilotClient, spark_version: str = "3.3") -> None:
+        self._client = client
+        self._spark_version = spark_version
+
+    def validate(
+        self,
+        pyspark_code: str,
+        cir_summary: str,
+    ) -> FunctionalValidationResult:
+        system = FUNCTIONAL_VALIDATOR_SYSTEM.format(spark_version=self._spark_version)
+        user_msg = FUNCTIONAL_VALIDATOR_USER.format(
+            spark_version=self._spark_version,
+            cir_summary=cir_summary,
+            pyspark_code=pyspark_code,
+        )
+        raw = self._client.simple_complete(system, user_msg)
+
+        raw = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
+        raw = re.sub(r'\s*```$', '', raw.strip(), flags=re.MULTILINE)
+
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not json_match:
+            logger.warning("FunctionalValidatorAgent returned non-JSON: %.200s", raw)
+            return FunctionalValidationResult(passed=True, equivalence_score=1.0)
+
+        try:
+            result = json.loads(json_match.group(0))
+        except json.JSONDecodeError:
+            logger.warning("FunctionalValidatorAgent JSON parse failed")
+            return FunctionalValidationResult(passed=True, equivalence_score=1.0)
+
+        passed = result.get("passed", True)
+        score = float(result.get("equivalence_score", 1.0))
+        critical = result.get("critical_issues", [])
+        warnings = result.get("warnings", [])
+
+        if critical:
+            logger.warning("Functional validation critical issues: %s", critical)
+        if warnings:
+            logger.info("Functional validation warnings: %s", warnings)
+
+        return FunctionalValidationResult(
+            passed=passed,
+            equivalence_score=score,
+            critical_issues=critical,
+            warnings=warnings,
         )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _strip_markdown_fences(text: str) -> str:
-    """Remove ```python ... ``` or ``` ... ``` fences from LLM output."""
     text = re.sub(r'^```(?:python|sql|pyspark)?\s*\n', '', text.strip(), flags=re.MULTILINE)
     text = re.sub(r'\n```\s*$', '', text.strip(), flags=re.MULTILINE)
     return text.strip()

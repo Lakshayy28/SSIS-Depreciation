@@ -224,13 +224,18 @@ class CopilotClient:
             finish_reason=choices[0].get("finish_reason", "stop"),
         )
 
-    def simple_complete(self, system_prompt: str, user_message: str) -> str:
-        """Convenience wrapper returning just the completion text."""
+    def simple_complete(self, system_prompt: str, user_message: str, model: str | None = None) -> str:
+        """Convenience wrapper returning just the completion text.
+
+        model: override the instance model for this single call (used so the
+               ReviewAgent can use a stronger model than the generator).
+        """
         req = CompletionRequest(
             messages=[
                 Message(role="system", content=system_prompt),
                 Message(role="user", content=user_message),
             ],
+            model=model or "",  # empty string → use instance default in to_dict()
         )
         resp = self.complete(req)
         return resp.content

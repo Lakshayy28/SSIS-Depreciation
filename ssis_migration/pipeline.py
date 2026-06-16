@@ -127,39 +127,59 @@ class MigrationPipeline:
         else:
             logger.info("[2/5] Deterministic skipped (mode=llm)")
 
-        # Phase 3: LLM augmentation
+        # Phase 3+4: LLM augmentation → codegen → functional validation loop
+        # (Phases 3 and 4 are wrapped in an outer loop so a failing functional
+        # validation can re-trigger LLM conversion with the validator's feedback.)
+        from ssis_migration.config import cfg as _cfg
+
         if mode == ConversionMode.DETERMINISTIC:
             logger.info("[3/5] LLM skipped (mode=deterministic)")
+            paths = self._codegen(cir, result, dtsx_path)
+            if paths is None:
+                return result
 
-        elif mode == ConversionMode.HYBRID:
-            # LLM only for items the deterministic engine flagged
-            if cir.conversion_metadata.llm_required_items:
-                self._run_llm(cir, dtsx_path)
-            else:
-                logger.info("[3/5] LLM skipped (0 LLM_REQUIRED items)")
+        else:
+            # HYBRID or LLM: outer functional-validation loop
+            max_func_iters = _cfg.functional_validation_max_iterations
+            functional_feedback: list[str] | None = None
 
-        elif mode == ConversionMode.LLM:
-            # Flag every component and SQL statement for LLM processing
-            self._flag_all_for_llm(cir)
-            self._run_llm(cir, dtsx_path)
+            for func_iter in range(1, max_func_iters + 1):
+                logger.info("[3/5] LLM pass %d/%d", func_iter, max_func_iters)
 
-        # Phase 4: Code generation
-        try:
-            paths = self._generator.generate(cir)
-            result.module_path = paths["module"]
-            result.test_path = paths["test"]
-            logger.info("[4/5] Code generation complete: %s", paths["module"])
-        except Exception as exc:
-            result.error = f"Code generation failed: {exc}"
-            logger.error("Code generation failed: %s", exc)
-            return result
+                if mode == ConversionMode.LLM:
+                    self._flag_all_for_llm(cir)
+
+                has_llm_items = bool(cir.conversion_metadata.llm_required_items)
+                if has_llm_items:
+                    self._run_llm(cir, dtsx_path, functional_feedback=functional_feedback)
+                else:
+                    logger.info("[3/5] LLM skipped (0 LLM_REQUIRED items)")
+
+                # Phase 4: generate code
+                paths = self._codegen(cir, result, dtsx_path)
+                if paths is None:
+                    return result
+
+                # Functional validation (only when token available + LLM was used)
+                if has_llm_items and self._config.github_token and func_iter < max_func_iters:
+                    func_result = self._run_functional_validation(result.module_path, cir, dtsx_path)
+                    if func_result is not None and not func_result.passed:
+                        logger.warning(
+                            "[3/5] Functional validation failed (score=%.2f) — re-converting (iter %d/%d)",
+                            func_result.equivalence_score, func_iter, max_func_iters,
+                        )
+                        functional_feedback = func_result.critical_issues
+                        self._reset_llm_items(cir)
+                        continue
+
+                logger.info("[3/5] Functional validation passed or skipped on iter %d", func_iter)
+                break
 
         # Phase 5: Validation
         try:
             static_report = self._static_validator.validate(result.module_path, cir)
             semantic_report = self._semantic_validator.validate(result.module_path, cir)
 
-            # Merge findings
             merged = static_report
             merged.findings.extend(semantic_report.findings)
             merged.acceptable_divergences.extend(semantic_report.acceptable_divergences)
@@ -167,7 +187,6 @@ class MigrationPipeline:
             result.validation_report = merged
             logger.info("[5/5] Validation: %s", merged.summary())
 
-            # Save validation report
             report_path = self._config.output_dir / f"validation_report_{dtsx_path.stem}.json"
             merged.save(report_path)
         except Exception as exc:
@@ -178,11 +197,32 @@ class MigrationPipeline:
                     "SUCCESS" if result.success else "ISSUES FOUND")
         return result
 
-    def _run_llm(self, cir: CIR, dtsx_path: Path) -> None:
+    def _codegen(self, cir: CIR, result: PipelineResult, dtsx_path: Path) -> dict | None:
+        """Run code generation, populate result.module_path/test_path. Returns paths or None on error."""
+        try:
+            paths = self._generator.generate(cir)
+            result.module_path = paths["module"]
+            result.test_path = paths["test"]
+            logger.info("[4/5] Code generation complete: %s", paths["module"])
+            return paths
+        except Exception as exc:
+            result.error = f"Code generation failed: {exc}"
+            logger.error("Code generation failed: %s", exc)
+            return None
+
+    def _run_llm(
+        self,
+        cir: CIR,
+        dtsx_path: Path,
+        functional_feedback: list[str] | None = None,
+    ) -> None:
         try:
             from ssis_migration.transform.llm import LLMPipeline
-            llm_pipeline = LLMPipeline(github_token=self._config.github_token)
-            llm_pipeline.process(cir)
+            llm_pipeline = LLMPipeline(
+                github_token=self._config.github_token,
+                spark_version=self._config.spark_version,
+            )
+            llm_pipeline.process(cir, functional_context=functional_feedback)
             logger.info(
                 "[3/5] LLM complete: human_review=%d",
                 len(cir.conversion_metadata.human_review_required),
@@ -191,6 +231,47 @@ class MigrationPipeline:
                 self._save_cir(cir, dtsx_path, stage="resolved")
         except Exception as exc:
             logger.warning("LLM pipeline failed (continuing without): %s", exc)
+
+    def _run_functional_validation(self, module_path: Path, cir: CIR, dtsx_path: Path):
+        """Run functional equivalence validation. Returns FunctionalValidationResult or None."""
+        try:
+            from ssis_migration.transform.llm import LLMPipeline
+            pyspark_code = module_path.read_text(encoding="utf-8")
+            llm_pipeline = LLMPipeline(
+                github_token=self._config.github_token,
+                spark_version=self._config.spark_version,
+            )
+            func_result = llm_pipeline.functional_validate(pyspark_code, cir)
+            logger.info(
+                "Functional validation: passed=%s score=%.2f critical=%d warnings=%d",
+                func_result.passed,
+                func_result.equivalence_score,
+                len(func_result.critical_issues),
+                len(func_result.warnings),
+            )
+            return func_result
+        except Exception as exc:
+            logger.warning("Functional validation failed (skipping): %s", exc)
+            return None
+
+    def _reset_llm_items(self, cir: CIR) -> None:
+        """Reset LLM_COMPLETE items back to LLM_REQUIRED so they can be re-converted."""
+        for exe in cir.control_flow.execution_tree:
+            if exe.conversion_status == ConversionStatus.LLM_COMPLETE:
+                exe.conversion_status = ConversionStatus.LLM_REQUIRED
+                exe.pyspark_snippet = None
+                cir.flag_for_llm(exe.id)
+            if exe.sql and exe.sql.transpilation_status.value == "complete":
+                from ssis_migration.cir.models import TranspilationStatus
+                exe.sql.transpilation_status = TranspilationStatus.LLM_REQUIRED
+        for df in cir.data_flows:
+            for comp in df.components:
+                if comp.conversion_status == ConversionStatus.LLM_COMPLETE:
+                    comp.conversion_status = ConversionStatus.LLM_REQUIRED
+                    comp.pyspark_snippet = None
+                    cir.flag_for_llm(comp.id)
+        # Clear human-review flags too so they get another chance
+        cir.conversion_metadata.human_review_required.clear()
 
     def _flag_all_for_llm(self, cir: CIR) -> None:
         """In pure LLM mode: flag convertible items for LLM; resolve structural ones immediately."""

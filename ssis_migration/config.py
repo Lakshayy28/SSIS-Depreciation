@@ -48,14 +48,24 @@ class Config:
     copilot_model: str = field(
         default_factory=lambda: os.environ.get("COPILOT_MODEL", "gpt-4o-mini")
     )
+    # Reviewer always uses a stronger model than generation by default.
+    # Override with COPILOT_REVIEWER_MODEL in .env.
+    copilot_reviewer_model: str = field(
+        default_factory=lambda: os.environ.get("COPILOT_REVIEWER_MODEL", "gpt-4o")
+    )
     copilot_temperature: float = field(
         default_factory=lambda: float(os.environ.get("COPILOT_TEMPERATURE", "0.1"))
     )
     copilot_max_tokens: int = field(
         default_factory=lambda: int(os.environ.get("COPILOT_MAX_TOKENS", "4096"))
     )
+    # Max review→regen iterations per component (each is one generation + one review call)
     copilot_max_review_iterations: int = field(
-        default_factory=lambda: int(os.environ.get("COPILOT_MAX_REVIEW_ITERATIONS", "3"))
+        default_factory=lambda: int(os.environ.get("COPILOT_MAX_REVIEW_ITERATIONS", "4"))
+    )
+    # Max outer functional-validation passes per package (each re-converts all LLM items)
+    functional_validation_max_iterations: int = field(
+        default_factory=lambda: int(os.environ.get("FUNCTIONAL_VALIDATION_MAX_ITERATIONS", "2"))
     )
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
