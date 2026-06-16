@@ -250,78 +250,109 @@ Generated snippet (spark, params, connections are already bound):
 ```
 """
 
-# ── Functional Equivalence Validator ─────────────────────────────────────────
+# ── Parsing Fidelity Auditor (DTSX → CIR) ────────────────────────────────────
+
+PARSING_FIDELITY_SYSTEM = """\
+You are auditing whether a canonical JSON model (the "CIR") faithfully captured
+an SSIS .dtsx package during parsing — BEFORE any code generation.
+
+You are NOT reviewing PySpark here. You are checking only this translation:
+    SSIS .dtsx (XML)  ──►  CIR (canonical summary)
+
+Identify anything present in the raw DTSX that is MISSING or MISREPRESENTED in
+the CIR: dropped executables, data-flow components, connection managers,
+parameters/variables, SQL statements, expressions, precedence constraints,
+event handlers, or wrong types/attributes.
+
+Return ONLY a raw JSON object (no markdown fences, no prose):
+{{
+  "fidelity_score": 0.0-1.0,
+  "missing_elements": ["<DTSX element absent from the CIR>"],
+  "misrepresentations": ["<DTSX element present but captured incorrectly>"]
+}}
+
+Score guide:
+  1.0  — CIR captures everything structurally and semantically significant
+  0.8+ — only cosmetic / non-behavioural omissions
+  < 0.6 — behaviourally significant content was dropped or mangled
+Ignore pure layout/GUI metadata (positions, colours) — those never matter.
+"""
+
+PARSING_FIDELITY_USER = """\
+Audit how completely the CIR captured this SSIS package.
+
+━━━ RAW SSIS .dtsx (XML, may be truncated) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{dtsx_excerpt}
+
+━━━ CIR (canonical summary produced by the parser) ━━━━━━━━━━━━━━━━━━━━━━━━━━
+{cir_summary}
+
+List everything in the DTSX that the CIR failed to capture or captured wrongly.
+"""
+
+# ── Functional Equivalence Reviewer (DTSX + CIR → PySpark) ────────────────────
 
 FUNCTIONAL_VALIDATOR_SYSTEM = """\
-You are a critical QA architect validating the functional equivalence of a PySpark
-migration against the original SSIS package definition.
+You are a critical QA architect performing the FINAL equivalence review of an
+SSIS→PySpark migration. You are given THREE views of the same package and must
+judge whether they describe the same behaviour:
 
-Your job: identify EVERY case where the generated PySpark code does NOT correctly
-replicate the SSIS package's behaviour. Be extremely thorough and strict.
+    1. the original SSIS .dtsx (XML, ground truth)
+    2. the CIR (canonical summary the migration worked from)
+    3. the generated PySpark {spark_version} module (the deliverable)
+
+Compare all three. The DTSX is ground truth; if the CIR and the PySpark agree
+with each other but BOTH diverge from the DTSX, that is still a CRITICAL issue.
+
+Be constructive but ruthless: every comment must name the exact SSIS behaviour
+and the exact place in the PySpark where it is missing, wrong, or unverifiable.
 
 Return ONLY a raw JSON object (no markdown fences, no prose):
 {{
   "passed": true/false,
   "equivalence_score": 0.0-1.0,
-  "critical_issues": [
-    "<concrete description — which SSIS behaviour is missing or wrong and where>"
-  ],
-  "warnings": [
-    "<non-critical divergence that should be reviewed>"
-  ]
+  "critical_issues": ["<which SSIS behaviour is missing/wrong in the PySpark>"],
+  "warnings": ["<non-critical divergence worth a human glance>"],
+  "version_issues": ["<any PySpark API used that is NOT valid in {spark_version}>"]
 }}
 
-Checks to perform (be exhaustive):
-
-1. CONTROL FLOW ORDER — Do all steps execute in the same order as SSIS precedence
-   constraints? Check for any missing steps.
-
-2. SQL SEMANTICS — For every SQL statement in the SSIS package, verify the Spark
-   equivalent uses the same tables, same JOIN conditions, same WHERE filters,
-   same aggregation logic. A missing WHERE clause or a wrong JOIN direction is
-   CRITICAL.
-
-3. DATA TRANSFORMATIONS — Every Derived Column, Conditional Split, Lookup, and
-   Merge Join in the SSIS data flow must have a corresponding operation in the
-   PySpark code. Missing transformation → CRITICAL issue.
-
-4. BUSINESS LOGIC — Conditional branching (IF/ELSE in expressions, Conditional
-   Split routing) must be preserved exactly.
-
-5. PARAMETER USAGE — SSIS package parameters must map to the correct Python
-   variable (via params dict). Wrong mapping → CRITICAL.
-
-6. ERROR HANDLING — SSIS failure precedence constraints (On Failure → next step)
-   must have equivalent try/except or fallback logic in the PySpark code.
-
-7. NULL HANDLING — ISNULL/COALESCE in SSIS must have equivalent F.coalesce or
-   F.when(...).isNull() in PySpark. Missing null guard → CRITICAL if source SQL
-   explicitly handles nulls.
-
-8. DATA TYPE CORRECTNESS — Type casts from the SSIS type system must produce
-   equivalent Spark types. DT_WSTR → StringType, DT_I4 → IntegerType, etc.
+Checks (be exhaustive):
+1. CONTROL FLOW ORDER — steps run in the same order as the DTSX precedence
+   constraints; on-success vs on-failure paths preserved; no steps dropped.
+2. SQL SEMANTICS — same tables, JOIN conditions, WHERE filters, GROUP BY,
+   aggregations. A missing filter or flipped join direction is CRITICAL.
+3. DATA TRANSFORMATIONS — every Derived Column / Conditional Split / Lookup /
+   Merge Join / Aggregate has a matching PySpark operation.
+4. BUSINESS LOGIC — conditional branching and routing preserved exactly.
+5. PARAMETER & VARIABLE USAGE — SSIS params/vars map to the right values.
+6. ERROR HANDLING — On-Failure precedence has equivalent try/except/fallback.
+7. NULL HANDLING — ISNULL/COALESCE preserved where the source handles nulls.
+8. DATA TYPES — SSIS type casts produce equivalent Spark types.
+9. PYSPARK {spark_version} VERSION — flag EVERY API not available in this exact
+   version into "version_issues" (these are also critical for equivalence).
 
 Score guide:
-  1.0  — Perfectly equivalent
-  0.8+ — Minor divergences only (warnings, no critical issues)
-  0.6–0.8  — Some non-critical gaps
-  < 0.6    — Critical functional mismatches; must be fixed
+  1.0  — perfectly equivalent on the target version
+  0.8+ — minor divergences only (warnings)
+  0.6–0.8 — non-critical gaps
+  < 0.6  — critical functional mismatch; must be fixed
 """
 
 FUNCTIONAL_VALIDATOR_USER = """\
-Validate functional equivalence between the SSIS package definition and the
-generated PySpark code.
+Review functional equivalence across the SSIS .dtsx, the CIR, and the generated
+PySpark module. Target PySpark version: {spark_version}
 
-Target PySpark version: {spark_version}
+━━━ 1. ORIGINAL SSIS .dtsx (XML ground truth, may be truncated) ━━━━━━━━━━━━━━
+{dtsx_excerpt}
 
-━━━ SSIS PACKAGE (Canonical Intermediate Representation) ━━━━━━━━━━━━━━━━━━━━━
+━━━ 2. CIR (canonical representation) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {cir_summary}
 
-━━━ GENERATED PYSPARK MODULE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━ 3. GENERATED PYSPARK {spark_version} MODULE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```python
 {pyspark_code}
 ```
 
-Does the PySpark module faithfully replicate every behaviour described in the
-SSIS package? Report every mismatch you find.
+Does the PySpark module faithfully replicate every behaviour in the DTSX? Report
+every mismatch, and flag any API not valid in PySpark {spark_version}.
 """

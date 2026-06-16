@@ -68,6 +68,7 @@ class PipelineResult:
     test_path: Path | None = None
     validation_report: ValidationReport | None = None
     routing_plan: object | None = None     # RoutingPlan (AUTO mode only)
+    scorecard: object | None = None        # MigrationScorecard (LLM modes)
     error: str | None = None
 
     @property
@@ -111,6 +112,13 @@ class MigrationPipeline:
             logger.error("Parse failed for %s: %s", dtsx_path, exc)
             return result
 
+        # Retain the raw DTSX XML so the equivalence reviewer + parsing-fidelity
+        # auditor can compare DTSX ↔ CIR ↔ PySpark directly (ground truth).
+        try:
+            dtsx_xml = dtsx_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            dtsx_xml = ""
+
         # Phase 2: Deterministic transformation (skipped in pure LLM mode)
         if mode != ConversionMode.LLM:
             try:
@@ -145,6 +153,8 @@ class MigrationPipeline:
         # validation can re-trigger LLM conversion with the validator's feedback.)
         from ssis_migration.config import cfg as _cfg
 
+        func_result = None      # last FunctionalValidationResult, for the scorecard
+
         if mode == ConversionMode.DETERMINISTIC:
             logger.info("[3/5] LLM skipped (mode=deterministic)")
             paths = self._codegen(cir, result, dtsx_path)
@@ -152,12 +162,17 @@ class MigrationPipeline:
                 return result
 
         else:
-            # HYBRID or LLM: outer functional-validation loop
-            max_func_iters = _cfg.functional_validation_max_iterations
+            # HYBRID / LLM / AUTO: review→regen→re-validate loop. Each pass:
+            #   convert LLM items → generate code → review equivalence vs DTSX →
+            #   if it fails, feed the critical issues back and re-convert.
+            # The final artifact is ALWAYS validated (even with 0 LLM items, so
+            # deterministic-only output is still equivalence-checked).
+            max_func_iters = max(1, _cfg.functional_validation_max_iterations)
             functional_feedback: list[str] | None = None
+            can_validate = bool(self._config.github_token)
 
             for func_iter in range(1, max_func_iters + 1):
-                logger.info("[3/5] LLM pass %d/%d", func_iter, max_func_iters)
+                logger.info("[3/5] conversion pass %d/%d", func_iter, max_func_iters)
 
                 if mode == ConversionMode.LLM:
                     self._flag_all_for_llm(cir)
@@ -173,19 +188,31 @@ class MigrationPipeline:
                 if paths is None:
                     return result
 
-                # Functional validation (only when token available + LLM was used)
-                if has_llm_items and self._config.github_token and func_iter < max_func_iters:
-                    func_result = self._run_functional_validation(result.module_path, cir, dtsx_path)
-                    if func_result is not None and not func_result.passed:
-                        logger.warning(
-                            "[3/5] Functional validation failed (score=%.2f) — re-converting (iter %d/%d)",
-                            func_result.equivalence_score, func_iter, max_func_iters,
-                        )
-                        functional_feedback = func_result.critical_issues
-                        self._reset_llm_items(cir)
-                        continue
+                if not can_validate:
+                    break
 
-                logger.info("[3/5] Functional validation passed or skipped on iter %d", func_iter)
+                # Equivalence review of the freshly generated artifact.
+                func_result = self._run_functional_validation(
+                    result.module_path, cir, dtsx_path, dtsx_xml,
+                )
+
+                regen_possible = has_llm_items and func_iter < max_func_iters
+                if func_result is not None and not func_result.passed and regen_possible:
+                    logger.warning(
+                        "[3/5] Equivalence review FAILED (score=%.2f) — re-converting "
+                        "with %d critical issue(s) as feedback (iter %d/%d)",
+                        func_result.equivalence_score, len(func_result.critical_issues),
+                        func_iter, max_func_iters,
+                    )
+                    functional_feedback = func_result.critical_issues
+                    self._reset_llm_items(cir)
+                    continue
+
+                logger.info(
+                    "[3/5] Equivalence review %s on iter %d",
+                    "PASSED" if (func_result is None or func_result.passed) else
+                    "still failing (iterations exhausted)", func_iter,
+                )
                 break
 
         # Phase 5: Validation
@@ -205,6 +232,16 @@ class MigrationPipeline:
         except Exception as exc:
             logger.error("Validation failed: %s", exc)
             result.error = f"Validation failed: {exc}"
+
+        # Scorecard: dual-axis (parsing × functional) migration fidelity score.
+        if mode != ConversionMode.DETERMINISTIC and result.module_path is not None:
+            try:
+                result.scorecard = self._build_scorecard(
+                    cir, dtsx_path, dtsx_xml, result.module_path, func_result,
+                )
+                logger.info("[score] %s", result.scorecard.summary())
+            except Exception as exc:
+                logger.warning("Scorecard build failed (skipping): %s", exc)
 
         logger.info("=== Pipeline end: %s — %s ===", dtsx_path.name,
                     "SUCCESS" if result.success else "ISSUES FOUND")
@@ -245,8 +282,10 @@ class MigrationPipeline:
         except Exception as exc:
             logger.warning("LLM pipeline failed (continuing without): %s", exc)
 
-    def _run_functional_validation(self, module_path: Path, cir: CIR, dtsx_path: Path):
-        """Run functional equivalence validation. Returns FunctionalValidationResult or None."""
+    def _run_functional_validation(
+        self, module_path: Path, cir: CIR, dtsx_path: Path, dtsx_xml: str = "",
+    ):
+        """Run functional equivalence review. Returns FunctionalValidationResult or None."""
         try:
             from ssis_migration.transform.llm import LLMPipeline
             pyspark_code = module_path.read_text(encoding="utf-8")
@@ -254,18 +293,76 @@ class MigrationPipeline:
                 github_token=self._config.github_token,
                 spark_version=self._config.spark_version,
             )
-            func_result = llm_pipeline.functional_validate(pyspark_code, cir)
+            func_result = llm_pipeline.functional_validate(pyspark_code, cir, dtsx_xml=dtsx_xml)
             logger.info(
-                "Functional validation: passed=%s score=%.2f critical=%d warnings=%d",
+                "Equivalence review: passed=%s score=%.2f critical=%d warnings=%d version=%d",
                 func_result.passed,
                 func_result.equivalence_score,
                 len(func_result.critical_issues),
                 len(func_result.warnings),
+                len(func_result.version_issues),
             )
             return func_result
         except Exception as exc:
             logger.warning("Functional validation failed (skipping): %s", exc)
             return None
+
+    def _build_scorecard(self, cir, dtsx_path, dtsx_xml, module_path, func_result):
+        """Assemble the dual-axis (parsing × functional) scorecard for this package."""
+        from ssis_migration import scoring
+
+        # ── Parsing axis: DTSX → CIR ──────────────────────────────────────────
+        dtsx_counts = scoring.count_dtsx_elements(dtsx_path)
+        cir_counts = scoring.count_cir_elements(cir)
+        coverage, detail = scoring.structural_coverage(dtsx_counts, cir_counts)
+        unmapped = scoring._unmapped_items(cir)
+
+        llm_fidelity = None
+        parse_issues: list[str] = []
+        if self._config.github_token:
+            try:
+                from ssis_migration.transform.llm import LLMPipeline
+                pf = LLMPipeline(
+                    github_token=self._config.github_token,
+                    spark_version=self._config.spark_version,
+                ).parsing_fidelity(cir, dtsx_xml)
+                llm_fidelity = pf.fidelity_score
+                parse_issues = list(pf.missing_elements) + list(pf.misrepresentations)
+            except Exception as exc:
+                logger.warning("Parsing-fidelity audit failed (using coverage only): %s", exc)
+
+        parsing = scoring.compute_parsing_score(
+            coverage, detail, unmapped, llm_fidelity, parse_issues,
+        )
+
+        # ── Functional axis: CIR/DTSX → PySpark ──────────────────────────────
+        code = module_path.read_text(encoding="utf-8") if module_path.exists() else ""
+        det_version_ok, det_version_issues = scoring.check_pyspark_version(
+            code, self._config.spark_version,
+        )
+        if func_result is not None:
+            equivalence = func_result.equivalence_score
+            critical = func_result.critical_issues
+            warnings = func_result.warnings
+            llm_version_issues = func_result.version_issues
+        else:
+            equivalence, critical, warnings, llm_version_issues = 1.0, [], [], []
+
+        version_issues = det_version_issues + list(llm_version_issues)
+        version_ok = det_version_ok and not llm_version_issues
+        functional = scoring.compute_functional_score(
+            equivalence, critical, warnings, version_ok, version_issues,
+        )
+
+        from ssis_migration.config import cfg
+        card = scoring.build_scorecard(
+            self._config.spark_version, parsing, functional,
+            threshold=cfg.migration_pass_threshold,
+        )
+
+        self._config.output_dir.mkdir(parents=True, exist_ok=True)
+        card.save(self._config.output_dir / f"scorecard_{dtsx_path.stem}.json")
+        return card
 
     def _reset_llm_items(self, cir: CIR) -> None:
         """Reset LLM_COMPLETE items back to LLM_REQUIRED so they can be re-converted."""

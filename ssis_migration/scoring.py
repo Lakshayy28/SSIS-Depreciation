@@ -26,12 +26,58 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from ssis_migration.cir.models import CIR
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Deterministic PySpark version validation ─────────────────────────────────
+
+# PySpark APIs keyed by the (major, minor) version that introduced them. If the
+# generated code calls one of these and the target version is older, it cannot
+# run there — a hard version failure that caps the functional score.
+_API_MIN_VERSION: dict[str, tuple[int, int]] = {
+    "applyInPandas": (3, 0),
+    "mapInPandas": (3, 0),
+    "observe": (3, 0),
+    "inputFiles": (3, 1),
+    "pandas_api": (3, 2),
+    "to_pandas_on_spark": (3, 2),
+    "mapInArrow": (3, 3),
+    "applyInPandasWithState": (3, 4),
+    "withColumnsRenamed": (3, 4),
+    "unpivot": (3, 4),
+    "melt": (3, 4),
+    "offset": (3, 4),
+}
+
+
+def parse_version(spark_version: str) -> tuple[int, int]:
+    parts = spark_version.split(".")
+    try:
+        return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    except (ValueError, IndexError):
+        return (3, 3)
+
+
+def check_pyspark_version(code: str, spark_version: str) -> tuple[bool, list[str]]:
+    """
+    Deterministically flag PySpark APIs in ``code`` that postdate ``spark_version``.
+    Returns (version_ok, issues).  Complements the LLM judge's version check.
+    """
+    target = parse_version(spark_version)
+    issues: list[str] = []
+    for api, min_ver in _API_MIN_VERSION.items():
+        if min_ver > target and re.search(rf'\b{re.escape(api)}\s*\(', code):
+            issues.append(
+                f"`{api}()` requires PySpark {min_ver[0]}.{min_ver[1]}+, "
+                f"but target is {spark_version}"
+            )
+    return (not issues, issues)
 
 
 # ─── Element counting (deterministic parsing coverage) ────────────────────────

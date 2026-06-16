@@ -316,6 +316,21 @@ def _print_result(result) -> None:
             f"human_review=[red]{counts['human_review']}[/red]"
         )
 
+    if result.scorecard is not None:
+        sc = result.scorecard
+        verdict = "[green]PASS[/green]" if sc.passed else "[red]FAIL[/red]"
+        vstat = "[green]ok[/green]" if sc.functional.version_ok else "[red]invalid[/red]"
+        console.print(
+            f"  Scorecard: composite=[bold]{sc.composite:.2f}[/bold] {verdict}  "
+            f"(parsing=[cyan]{sc.parsing.score:.2f}[/cyan] × "
+            f"functional=[cyan]{sc.functional.score:.2f}[/cyan])  "
+            f"spark {sc.spark_version}=[{vstat}]"
+        )
+        for issue in sc.functional.critical_issues[:3]:
+            console.print(f"    [red]CRIT[/red] {issue}")
+        for issue in sc.functional.version_issues[:2]:
+            console.print(f"    [red]VER [/red] {issue}")
+
     if result.validation_report:
         status = "[green]PASS[/green]" if result.validation_report.passed else "[red]FAIL[/red]"
         console.print(f"  Validation: {status}")

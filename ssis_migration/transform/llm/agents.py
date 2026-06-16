@@ -31,6 +31,8 @@ from ssis_migration.transform.llm.prompts import (
     FUNCTIONAL_CONTEXT_SUFFIX,
     FUNCTIONAL_VALIDATOR_SYSTEM,
     FUNCTIONAL_VALIDATOR_USER,
+    PARSING_FIDELITY_SYSTEM,
+    PARSING_FIDELITY_USER,
     REGEN_SUFFIX,
     REVIEW_SYSTEM,
     REVIEW_USER,
@@ -57,6 +59,14 @@ class FunctionalValidationResult:
     equivalence_score: float    # 0.0–1.0
     critical_issues: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    version_issues: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ParsingFidelityResult:
+    fidelity_score: float       # 0.0–1.0
+    missing_elements: list[str] = field(default_factory=list)
+    misrepresentations: list[str] = field(default_factory=list)
 
 
 # ── ReviewAgent ───────────────────────────────────────────────────────────────
@@ -324,44 +334,42 @@ class FunctionalValidatorAgent:
     re-generated with the critical issues as additional context.
     """
 
-    def __init__(self, client: CopilotClient, spark_version: str = "3.3") -> None:
+    def __init__(self, client: CopilotClient, spark_version: str = "3.3",
+                 reviewer_model: str | None = None) -> None:
         self._client = client
         self._spark_version = spark_version
+        self._reviewer_model = reviewer_model
 
     def validate(
         self,
         pyspark_code: str,
         cir_summary: str,
+        dtsx_excerpt: str = "not available",
     ) -> FunctionalValidationResult:
         system = FUNCTIONAL_VALIDATOR_SYSTEM.format(spark_version=self._spark_version)
         user_msg = FUNCTIONAL_VALIDATOR_USER.format(
             spark_version=self._spark_version,
+            dtsx_excerpt=dtsx_excerpt,
             cir_summary=cir_summary,
             pyspark_code=pyspark_code,
         )
-        raw = self._client.simple_complete(system, user_msg)
+        raw = self._complete(system, user_msg)
 
-        raw = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
-        raw = re.sub(r'\s*```$', '', raw.strip(), flags=re.MULTILINE)
-
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if not json_match:
+        result = _extract_json(raw)
+        if result is None:
             logger.warning("FunctionalValidatorAgent returned non-JSON: %.200s", raw)
-            return FunctionalValidationResult(passed=True, equivalence_score=1.0)
-
-        try:
-            result = json.loads(json_match.group(0))
-        except json.JSONDecodeError:
-            logger.warning("FunctionalValidatorAgent JSON parse failed")
             return FunctionalValidationResult(passed=True, equivalence_score=1.0)
 
         passed = result.get("passed", True)
         score = float(result.get("equivalence_score", 1.0))
         critical = result.get("critical_issues", [])
         warnings = result.get("warnings", [])
+        version_issues = result.get("version_issues", [])
 
         if critical:
             logger.warning("Functional validation critical issues: %s", critical)
+        if version_issues:
+            logger.warning("Functional validation version issues: %s", version_issues)
         if warnings:
             logger.info("Functional validation warnings: %s", warnings)
 
@@ -370,6 +378,53 @@ class FunctionalValidatorAgent:
             equivalence_score=score,
             critical_issues=critical,
             warnings=warnings,
+            version_issues=version_issues,
+        )
+
+    def _complete(self, system: str, user_msg: str) -> str:
+        if self._reviewer_model:
+            return self._client.simple_complete(system, user_msg, model=self._reviewer_model)
+        return self._client.simple_complete(system, user_msg)
+
+
+# ── ParsingFidelityAgent ──────────────────────────────────────────────────────
+
+class ParsingFidelityAgent:
+    """
+    Audits the DTSX → CIR translation: did the parser capture everything in the
+    raw .dtsx?  This is the LLM half of the parsing-fidelity score.
+    """
+
+    def __init__(self, client: CopilotClient, reviewer_model: str | None = None) -> None:
+        self._client = client
+        self._reviewer_model = reviewer_model
+
+    def audit(self, dtsx_excerpt: str, cir_summary: str) -> ParsingFidelityResult:
+        user_msg = PARSING_FIDELITY_USER.format(
+            dtsx_excerpt=dtsx_excerpt,
+            cir_summary=cir_summary,
+        )
+        if self._reviewer_model:
+            raw = self._client.simple_complete(PARSING_FIDELITY_SYSTEM, user_msg,
+                                               model=self._reviewer_model)
+        else:
+            raw = self._client.simple_complete(PARSING_FIDELITY_SYSTEM, user_msg)
+
+        result = _extract_json(raw)
+        if result is None:
+            logger.warning("ParsingFidelityAgent returned non-JSON: %.200s", raw)
+            return ParsingFidelityResult(fidelity_score=1.0)
+
+        missing = result.get("missing_elements", [])
+        misrep = result.get("misrepresentations", [])
+        if missing:
+            logger.warning("Parsing fidelity — missing from CIR: %s", missing)
+        if misrep:
+            logger.warning("Parsing fidelity — misrepresented in CIR: %s", misrep)
+        return ParsingFidelityResult(
+            fidelity_score=float(result.get("fidelity_score", 1.0)),
+            missing_elements=missing,
+            misrepresentations=misrep,
         )
 
 
@@ -384,3 +439,16 @@ def _strip_markdown_fences(text: str) -> str:
 def _base_confidence(iteration: int) -> float:
     """Higher confidence when review passes on first attempt."""
     return max(0.5, 1.0 - (iteration - 1) * 0.15)
+
+
+def _extract_json(raw: str) -> dict | None:
+    """Pull the first JSON object out of an LLM response, tolerating fences/prose."""
+    raw = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
+    raw = re.sub(r'\s*```$', '', raw.strip(), flags=re.MULTILINE)
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None

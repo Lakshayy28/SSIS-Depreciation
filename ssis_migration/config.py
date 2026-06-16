@@ -98,6 +98,10 @@ class Config:
     llm_confidence_threshold: float = field(
         default_factory=lambda: float(os.environ.get("LLM_CONFIDENCE_THRESHOLD", "0.50"))
     )
+    # Composite scorecard threshold (parsing × functional) a package must clear.
+    migration_pass_threshold: float = field(
+        default_factory=lambda: float(os.environ.get("MIGRATION_PASS_THRESHOLD", "0.75"))
+    )
 
     # ── Output ────────────────────────────────────────────────────────────────
     output_dir: Path = field(

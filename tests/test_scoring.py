@@ -8,10 +8,12 @@ import pytest
 
 from ssis_migration.scoring import (
     build_scorecard,
+    check_pyspark_version,
     compute_functional_score,
     compute_parsing_score,
     count_cir_elements,
     count_dtsx_elements,
+    parse_version,
     structural_coverage,
 )
 
@@ -98,6 +100,39 @@ def test_version_failure_fails_scorecard():
     fs = compute_functional_score(1.0, [], [], version_ok=False, version_issues=["x"])
     card = build_scorecard("2.4", ps, fs, threshold=0.4)
     assert card.passed is False
+
+
+# ─── PySpark version validation ───────────────────────────────────────────────
+
+def test_parse_version():
+    assert parse_version("2.4.8") == (2, 4)
+    assert parse_version("3.3") == (3, 3)
+    assert parse_version("3") == (3, 0)
+
+
+def test_version_flags_spark3_api_on_24_target():
+    code = "df.mapInPandas(fn, schema)"
+    ok, issues = check_pyspark_version(code, "2.4.8")
+    assert ok is False
+    assert any("mapInPandas" in i for i in issues)
+
+
+def test_version_ok_when_api_available():
+    code = "df.mapInPandas(fn, schema)"
+    ok, issues = check_pyspark_version(code, "3.3")
+    assert ok is True
+    assert issues == []
+
+
+def test_version_flags_34_api_on_33_target():
+    ok, issues = check_pyspark_version("df.unpivot(['a'], ['b'], 'k', 'v')", "3.3")
+    assert ok is False
+
+
+def test_version_ignores_substring_false_positives():
+    # "offsetight" should not match the offset( API
+    ok, _ = check_pyspark_version("x = my_offsetight", "2.4")
+    assert ok is True
 
 
 # ─── element counting against a real sample ───────────────────────────────────

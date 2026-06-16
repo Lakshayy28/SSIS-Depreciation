@@ -21,6 +21,7 @@ from ssis_migration.transform.llm.agents import (
     ComplexSQLAgent,
     ExpressionAgent,
     FunctionalValidatorAgent,
+    ParsingFidelityAgent,
     ReviewAgent,
     ScriptTaskAgent,
 )
@@ -69,7 +70,13 @@ class LLMPipeline:
             spark_version=spark_version,
         )
         self._expr_agent = ExpressionAgent(self._client, spark_version=spark_version)
-        self._func_validator = FunctionalValidatorAgent(self._client, spark_version=spark_version)
+        # Judges use the (stronger) reviewer model, like the component reviewer.
+        self._func_validator = FunctionalValidatorAgent(
+            self._client, spark_version=spark_version, reviewer_model=_reviewer_model,
+        )
+        self._parsing_agent = ParsingFidelityAgent(
+            self._client, reviewer_model=_reviewer_model,
+        )
 
     def process(self, cir: CIR, functional_context: list[str] | None = None) -> CIR:
         logger.info(
@@ -97,11 +104,20 @@ class LLMPipeline:
         )
         return cir
 
-    def functional_validate(self, pyspark_code: str, cir: CIR):
-        """Run package-level functional equivalence check. Returns FunctionalValidationResult."""
-        from ssis_migration.transform.llm.agents import FunctionalValidationResult
+    def functional_validate(self, pyspark_code: str, cir: CIR, dtsx_xml: str | None = None):
+        """
+        Package-level functional equivalence review comparing the raw DTSX, the
+        CIR, and the generated PySpark. Returns FunctionalValidationResult.
+        """
         cir_summary = _build_cir_summary(cir)
-        return self._func_validator.validate(pyspark_code, cir_summary)
+        excerpt = _excerpt_dtsx(dtsx_xml) if dtsx_xml else "not available"
+        return self._func_validator.validate(pyspark_code, cir_summary, dtsx_excerpt=excerpt)
+
+    def parsing_fidelity(self, cir: CIR, dtsx_xml: str | None = None):
+        """LLM audit of DTSX → CIR fidelity. Returns ParsingFidelityResult."""
+        cir_summary = _build_cir_summary(cir)
+        excerpt = _excerpt_dtsx(dtsx_xml) if dtsx_xml else "not available"
+        return self._parsing_agent.audit(excerpt, cir_summary)
 
     # ── private ───────────────────────────────────────────────────────────────
 
@@ -227,6 +243,35 @@ class LLMPipeline:
                         ConversionStatus.LLM_COMPLETE, ConversionStatus.DETERMINISTIC
                     )
         return False
+
+
+_DTSX_EXCERPT_LIMIT = 16000
+
+
+def _excerpt_dtsx(dtsx_xml: str, limit: int = _DTSX_EXCERPT_LIMIT) -> str:
+    """
+    Trim a raw DTSX string to a token-budget-friendly excerpt for the judges.
+
+    Most of a .dtsx's bulk is GUI layout metadata (DTS:DesignTimeProperties,
+    component coordinates) that has no bearing on equivalence, so we drop those
+    first and only then hard-truncate.
+    """
+    import re as _re
+
+    if not dtsx_xml:
+        return "not available"
+    # Strip the layout blob if present — pure GUI metadata, never behavioural.
+    cleaned = _re.sub(
+        r"<DTS:DesignTimeProperties.*?</DTS:DesignTimeProperties>",
+        "<!-- design-time layout omitted -->",
+        dtsx_xml,
+        flags=_re.DOTALL,
+    )
+    if len(cleaned) <= limit:
+        return cleaned
+    head = cleaned[: int(limit * 0.7)]
+    tail = cleaned[-int(limit * 0.3):]
+    return f"{head}\n\n<!-- … {len(cleaned) - limit} chars omitted … -->\n\n{tail}"
 
 
 def _build_cir_summary(cir: CIR) -> str:
