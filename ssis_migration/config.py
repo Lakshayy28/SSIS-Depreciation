@@ -93,7 +93,7 @@ class Config:
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
     conversion_mode: str = field(
-        default_factory=lambda: os.environ.get("CONVERSION_MODE", "hybrid")
+        default_factory=lambda: os.environ.get("CONVERSION_MODE", "auto")
     )
     llm_confidence_threshold: float = field(
         default_factory=lambda: float(os.environ.get("LLM_CONFIDENCE_THRESHOLD", "0.50"))

@@ -231,10 +231,10 @@ class LLMPipeline:
 
 def _build_cir_summary(cir: CIR) -> str:
     """Produce a compact human-readable summary of the CIR for the functional validator."""
-    import json as _json
+    from pathlib import Path as _Path
 
     lines = [
-        f"Package: {cir.metadata.package_name}",
+        f"Package: {_Path(cir.metadata.source_file).stem}",
         f"Complexity: {cir.metadata.complexity_score.value}",
         f"Parameters: {[p.name for p in cir.parameters]}",
         f"Connections: {[c.name for c in cir.connections]}",

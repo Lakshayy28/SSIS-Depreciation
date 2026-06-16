@@ -100,9 +100,10 @@ def assess(dtsx_dir: Path, output: Path | None) -> None:
 @click.option("--output", "-o", type=click.Path(path_type=Path), default=None)
 @click.option(
     "--mode", "-m",
-    type=click.Choice(["deterministic", "hybrid", "llm"]),
+    type=click.Choice(["deterministic", "hybrid", "llm", "auto"]),
     default=None,
-    help="Conversion mode (default: from CONVERSION_MODE in .env, else hybrid)",
+    help="Conversion mode (default: from CONVERSION_MODE in .env). "
+         "auto = deterministic + risk-aware per-item routing.",
 )
 @click.option("--spark-version", default=None, help="Target PySpark version")
 @click.option("--github-token", envvar="GITHUB_TOKEN", default=None,
@@ -230,7 +231,7 @@ def compare(dtsx_file: Path, output: Path | None, github_token: str | None) -> N
 @click.option("--output", "-o", type=click.Path(path_type=Path), default=None)
 @click.option("--wave", type=click.Choice(["all", "simple", "medium", "high", "very_high"]),
               default="all")
-@click.option("--mode", "-m", type=click.Choice(["deterministic", "hybrid", "llm"]), default=None)
+@click.option("--mode", "-m", type=click.Choice(["deterministic", "hybrid", "llm", "auto"]), default=None)
 @click.option("--github-token", envvar="GITHUB_TOKEN", default=None)
 def run_pipeline(
     dtsx_dir: Path, output: Path | None, wave: str,
@@ -305,6 +306,14 @@ def _print_result(result) -> None:
             f"  det. coverage=[cyan]{cov*100:.0f}%[/cyan]  "
             f"llm_items=[yellow]{llm_n}[/yellow]  "
             f"human_review=[red]{hr_n}[/red]"
+        )
+
+    if result.routing_plan is not None:
+        counts = result.routing_plan.counts()
+        console.print(
+            f"  AUTO routing: deterministic=[cyan]{counts['deterministic']}[/cyan]  "
+            f"llm=[yellow]{counts['llm']}[/yellow]  "
+            f"human_review=[red]{counts['human_review']}[/red]"
         )
 
     if result.validation_report:

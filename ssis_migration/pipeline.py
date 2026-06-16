@@ -38,6 +38,7 @@ class ConversionMode(str, Enum):
     DETERMINISTIC = "deterministic"
     HYBRID = "hybrid"
     LLM = "llm"
+    AUTO = "auto"        # deterministic + risk-aware router decides per item
 
 
 @dataclass
@@ -66,6 +67,7 @@ class PipelineResult:
     module_path: Path | None = None
     test_path: Path | None = None
     validation_report: ValidationReport | None = None
+    routing_plan: object | None = None     # RoutingPlan (AUTO mode only)
     error: str | None = None
 
     @property
@@ -121,6 +123,17 @@ class MigrationPipeline:
                 result.error = f"Deterministic engine failed: {exc}"
                 logger.error("Deterministic engine failed: %s", exc)
                 return result
+
+            # AUTO mode: risk-aware router decides, per item, what the
+            # deterministic engine produced can be trusted vs. what must be
+            # escalated to the LLM (or to a human) for faithfulness.
+            if mode == ConversionMode.AUTO:
+                from ssis_migration.transform.routing import Router
+                router = Router()
+                plan = router.plan(cir)
+                result.routing_plan = plan
+                logger.info("[2.5/5] AUTO routing: %s", plan.counts())
+                self._save_routing_report(plan, dtsx_path)
 
             if self._config.save_cir:
                 self._save_cir(cir, dtsx_path, stage="annotated")
@@ -306,3 +319,10 @@ class MigrationPipeline:
         cir_path = cir_dir / f"{dtsx_path.stem}_cir_{stage}.json"
         cir.save(cir_path)
         logger.debug("Saved CIR: %s", cir_path)
+
+    def _save_routing_report(self, plan, dtsx_path: Path) -> None:
+        import json
+        self._config.output_dir.mkdir(parents=True, exist_ok=True)
+        path = self._config.output_dir / f"routing_report_{dtsx_path.stem}.json"
+        path.write_text(json.dumps(plan.to_report(), indent=2), encoding="utf-8")
+        logger.debug("Saved routing report: %s", path)
