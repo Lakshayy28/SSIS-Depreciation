@@ -62,6 +62,9 @@ def show_config() -> None:
     table.add_row("COPILOT_MAX_REVIEW_ITERATIONS", str(cfg.copilot_max_review_iterations))
     table.add_row("FUNCTIONAL_VALIDATION_MAX_ITERATIONS", str(cfg.functional_validation_max_iterations))
     table.add_row("LLM_CONFIDENCE_THRESHOLD", str(cfg.llm_confidence_threshold))
+    table.add_row("MIGRATION_PASS_THRESHOLD", str(cfg.migration_pass_threshold))
+    table.add_row("COPILOT_MAX_RETRIES", str(cfg.copilot_max_retries))
+    table.add_row("COPILOT_CIRCUIT_BREAKER_THRESHOLD", str(cfg.circuit_breaker_threshold))
     table.add_row("OUTPUT_DIR", str(cfg.output_dir))
     table.add_row("LOG_LEVEL", cfg.log_level)
     token_val = "[green]SET[/green]" if cfg.has_llm_token else "[red]NOT SET — LLM phases will fail[/red]"
@@ -180,6 +183,10 @@ def compare(dtsx_file: Path, output: Path | None, github_token: str | None) -> N
         table.add_row(label, *[str(fn(results[m.value])) for m in ConversionMode])
 
     _row("Pipeline error", lambda r: r.error or "—")
+    _row("Scorecard composite", lambda r: f"{r.scorecard.composite:.2f}" if r.scorecard else "—")
+    _row("  parsing", lambda r: f"{r.scorecard.parsing.score:.2f}" if r.scorecard else "—")
+    _row("  functional", lambda r: f"{r.scorecard.functional.score:.2f}" if r.scorecard else "—")
+    _row("Scorecard passed", lambda r: ("✓" if r.scorecard.passed else "✗") if r.scorecard else "—")
     _row("Validation passed", lambda r: "✓" if (r.validation_report and r.validation_report.passed) else "✗")
     _row("Errors", lambda r: str(len(r.validation_report.errors)) if r.validation_report else "—")
     _row("Warnings", lambda r: str(len(r.validation_report.warnings)) if r.validation_report else "—")
