@@ -69,6 +69,28 @@ class Config:
         default_factory=lambda: int(os.environ.get("FUNCTIONAL_VALIDATION_MAX_ITERATIONS", "2"))
     )
 
+    # ── Resilience / NFRs (Copilot API) ───────────────────────────────────────
+    # Per-request timeout in seconds.
+    copilot_request_timeout: float = field(
+        default_factory=lambda: float(os.environ.get("COPILOT_REQUEST_TIMEOUT", "120"))
+    )
+    # Max HTTP attempts per call (transport errors, 429, 5xx). 4xx never retried.
+    copilot_max_retries: int = field(
+        default_factory=lambda: int(os.environ.get("COPILOT_MAX_RETRIES", "3"))
+    )
+    # Circuit breaker: open after this many consecutive failed calls.
+    circuit_breaker_threshold: int = field(
+        default_factory=lambda: int(os.environ.get("COPILOT_CIRCUIT_BREAKER_THRESHOLD", "5"))
+    )
+    # Circuit breaker: seconds to stay open before allowing a half-open probe.
+    circuit_breaker_cooldown: float = field(
+        default_factory=lambda: float(os.environ.get("COPILOT_CIRCUIT_BREAKER_COOLDOWN", "30"))
+    )
+    # Client-side rate limit in requests/minute (0 = unlimited).
+    copilot_rate_limit_per_min: float = field(
+        default_factory=lambda: float(os.environ.get("COPILOT_RATE_LIMIT_PER_MIN", "0"))
+    )
+
     # ── Pipeline ──────────────────────────────────────────────────────────────
     conversion_mode: str = field(
         default_factory=lambda: os.environ.get("CONVERSION_MODE", "hybrid")

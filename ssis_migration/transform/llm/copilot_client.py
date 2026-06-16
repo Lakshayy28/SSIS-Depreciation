@@ -26,12 +26,28 @@ from typing import Any
 
 import httpx
 
+from ssis_migration.resilience import (
+    CircuitBreaker,
+    CircuitBreakerError,
+    TokenBucket,
+    backoff_delay,
+)
+
 logger = logging.getLogger(__name__)
 
 _COPILOT_BASE_URL = "https://api.githubcopilot.com"
 _CHAT_ENDPOINT = f"{_COPILOT_BASE_URL}/chat/completions"
-_MAX_RETRIES = 3
-_RETRY_BACKOFF = [1.0, 2.0, 4.0]
+
+# Process-wide circuit breaker name for the Copilot endpoint. Every CopilotClient
+# instance (the pipeline builds several per package) shares this breaker, so a
+# dead endpoint trips once and fast-fails the whole run instead of per-instance.
+_BREAKER_NAME = "copilot_chat"
+# Lazily built from cfg on first client construction (shared across instances).
+_RATE_LIMITER: TokenBucket | None = None
+
+
+class CopilotUnavailableError(RuntimeError):
+    """Raised when the Copilot endpoint is unreachable or the breaker is open."""
 
 # One JSON-L file per process inside the project so logs are easy to inspect.
 # The directory is git-ignored — logs are never committed.
@@ -117,11 +133,27 @@ class CopilotClient:
     """
 
     def __init__(self, token: str | None = None, model: str | None = None) -> None:
+        global _RATE_LIMITER
         from ssis_migration.config import cfg
         self._token = token or cfg.github_token
         self._model = model or cfg.copilot_model
         self._temperature = cfg.copilot_temperature
         self._max_tokens = cfg.copilot_max_tokens
+
+        # ── NFR knobs ──────────────────────────────────────────────────────────
+        self._timeout = cfg.copilot_request_timeout
+        self._max_retries = max(1, cfg.copilot_max_retries)
+        self._breaker = CircuitBreaker.get(
+            _BREAKER_NAME,
+            failure_threshold=cfg.circuit_breaker_threshold,
+            recovery_timeout=cfg.circuit_breaker_cooldown,
+        )
+        if _RATE_LIMITER is None and cfg.copilot_rate_limit_per_min > 0:
+            # Convert requests/minute → tokens/second; allow a small burst.
+            rate = cfg.copilot_rate_limit_per_min / 60.0
+            _RATE_LIMITER = TokenBucket(rate=rate, capacity=max(1.0, rate * 5))
+        self._rate_limiter = _RATE_LIMITER
+
         logger.info("Copilot request/response log: %s", _LOG_PATH)
         if not self._token:
             logger.warning(
@@ -160,10 +192,27 @@ class CopilotClient:
             "payload": _mask_sensitive(payload),
         })
 
+        # NFR 1 — client-side rate limiting (no-op unless COPILOT_RATE_LIMIT_PER_MIN > 0)
+        if self._rate_limiter is not None:
+            self._rate_limiter.acquire()
+
+        # NFR 2 — circuit breaker: fast-fail if the endpoint is presumed dead.
+        try:
+            self._breaker.before_call()
+        except CircuitBreakerError as exc:
+            _write_log({
+                "event": "circuit_open",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "detail": str(exc),
+            })
+            raise CopilotUnavailableError(str(exc)) from exc
+
+        # NFR 3 — bounded retry with jittered exponential backoff.
         last_exc: Exception | None = None
-        for attempt, backoff in enumerate(_RETRY_BACKOFF):
+        for attempt in range(1, self._max_retries + 1):
+            delay = backoff_delay(attempt, base_delay=1.0, max_delay=30.0)
             try:
-                with httpx.Client(timeout=120.0) as client:
+                with httpx.Client(timeout=self._timeout) as client:
                     resp = client.post(_CHAT_ENDPOINT, headers=headers, json=payload)
 
                 if resp.status_code == 200:
@@ -174,40 +223,62 @@ class CopilotClient:
                         "status": resp.status_code,
                         "body": _mask_sensitive(resp_data),
                     })
+                    self._breaker.record_success()
                     return self._parse_response(resp_data)
 
                 _write_log({
                     "event": "response_error",
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "status": resp.status_code,
+                    "attempt": attempt,
                     "body": resp.text[:2000],
                 })
 
                 if resp.status_code == 429:
-                    retry_after = float(resp.headers.get("retry-after", backoff))
-                    logger.warning("Rate limited; waiting %.1fs before retry %d", retry_after, attempt + 1)
-                    time.sleep(retry_after)
-                    continue
+                    retry_after = float(resp.headers.get("retry-after", delay))
+                    logger.warning("Rate limited; waiting %.1fs before retry %d", retry_after, attempt)
+                    self._breaker.record_failure()
+                    if attempt < self._max_retries:
+                        time.sleep(retry_after)
+                        continue
+                    raise CopilotUnavailableError("Copilot API rate limit exhausted")
 
                 if resp.status_code >= 500:
-                    logger.warning("Server error %d on attempt %d", resp.status_code, attempt + 1)
-                    time.sleep(backoff)
-                    continue
+                    logger.warning("Server error %d on attempt %d", resp.status_code, attempt)
+                    self._breaker.record_failure()
+                    if attempt < self._max_retries:
+                        time.sleep(delay)
+                        continue
+                    raise CopilotUnavailableError(
+                        f"Copilot API server error {resp.status_code} after {attempt} attempts"
+                    )
 
-                # 4xx errors other than 429 are not retryable
-                resp.raise_for_status()
+                # 4xx other than 429 are caller/config errors — not retryable and
+                # NOT a breaker failure (a bad model id shouldn't trip the breaker).
+                raise RuntimeError(
+                    f"GitHub Copilot API error: {resp.status_code} {resp.text[:500]}"
+                )
 
             except httpx.TimeoutException as exc:
-                logger.warning("Timeout on attempt %d: %s", attempt + 1, exc)
-                _write_log({"event": "timeout", "ts": datetime.now(timezone.utc).isoformat(), "attempt": attempt + 1})
+                logger.warning("Timeout on attempt %d: %s", attempt, exc)
+                _write_log({"event": "timeout", "ts": datetime.now(timezone.utc).isoformat(), "attempt": attempt})
+                self._breaker.record_failure()
                 last_exc = exc
-                time.sleep(backoff)
+                if attempt < self._max_retries:
+                    time.sleep(delay)
+                    continue
+            except httpx.TransportError as exc:
+                logger.warning("Transport error on attempt %d: %s", attempt, exc)
+                _write_log({"event": "transport_error", "ts": datetime.now(timezone.utc).isoformat(),
+                            "attempt": attempt, "detail": str(exc)})
+                self._breaker.record_failure()
+                last_exc = exc
+                if attempt < self._max_retries:
+                    time.sleep(delay)
+                    continue
 
-            except httpx.HTTPStatusError as exc:
-                raise RuntimeError(f"GitHub Copilot API error: {exc.response.status_code} {exc.response.text}") from exc
-
-        raise RuntimeError(
-            f"GitHub Copilot API unreachable after {_MAX_RETRIES} retries"
+        raise CopilotUnavailableError(
+            f"GitHub Copilot API unreachable after {self._max_retries} attempts"
         ) from last_exc
 
     def _parse_response(self, data: dict[str, Any]) -> CompletionResponse:
