@@ -161,21 +161,27 @@ produced.
   CIR (Pydantic model, JSON-serialisable)
 ```
 
-### Namespace handling — the hard-won lesson
+### Full-spectrum dialect handling — the hard-won lessons
 
-Real-world `.dtsx` files mix **two dialects** in the same file: control-flow
-elements (`DTS:Executable`, `DTS:ConnectionManager`, …) are namespaced, but the
-embedded **data-flow pipeline XML** (`<pipeline><components><component>…`) is
-frequently **completely unprefixed**, and property collections appear as
-either `properties/property` (modern) or
-`customPropertyCollection/customProperty` (legacy). Every element lookup in
-[`data_flow.py`](../ssis_migration/parser/extractors/data_flow.py) therefore
-matches by **local name**, ignoring namespace, via small helpers
-(`_children`, `_first`, `_descendants`). Component class identification accepts
-**both** GUID `componentClassID`s (`{BCEFE59B-…}`) and modern logical names
-(`Microsoft.OLEDBSource`) via `map_component_class()` in
-[`parser/ns.py`](../ssis_migration/parser/ns.py). SSIS pipeline `dataType`
-values are normalized (`i4` → `DT_I4`) by `normalize_ssis_type()` in
+The DTSX format is not one format. It changed fundamentally at SQL Server
+2012 (the "Denali" refactor) and varies by writer even within an era; the
+parser handles the whole spectrum
+(regression-locked by `tests/test_parser_spectrum.py`):
+
+| Variation | Handling |
+|---|---|
+| **PackageFormatVersion 2/3** (2005/2008): properties are `<DTS:Property DTS:Name="ObjectName">` **child elements**, not attributes | `ns.dts_attr()` reads namespaced attribute → bare attribute → property child; used by every extractor |
+| **ExecutableType eras**: `Microsoft.ExecuteSQLTask` (modern), `SSIS.Pipeline.3` / `STOCK:SEQUENCE` (versioned stock), assembly-qualified .NET names (2008–2014) | `map_executable_type()` — curated map first, then token matching on the dotted type portion |
+| **componentClassID GUIDs change per SSIS version** (no table can be exhaustive) | GUID map → logical-name map → `contactInfo` display-name / component-name keyword fallback |
+| **Pipeline XML namespacing**: namespaced or completely unprefixed; `properties/property` vs `customPropertyCollection/customProperty` | all data-flow lookups match by **local name** (`_children`, `_first`, `_descendants`) |
+| **ProtectionLevel**: `EncryptAllWith*` bodies are encrypted blobs | raises a clear, actionable error (never a silently-empty CIR); `EncryptSensitive*` parses with a warning; level + format version recorded in `cir.metadata` |
+| **Execute SQL statement sources**: `DirectInput` vs `Variable` / `FileConnection` | variable/file sources are never treated as literal SQL; they carry an explanatory note and route to human review; parameter/result bindings captured |
+| **Script task storage**: legacy `BinaryCode`/`ScriptCode` blob vs modern `ScriptProject/ProjectItem` multi-file VSTA project | all source items joined, binary blobs excluded (code-vs-base64 heuristic), language + ReadOnly/ReadWriteVariables captured |
+| **Container-scoped variables** (loop iteration vars) | every `DTS:Variables` collection in the tree is extracted, scoped to its container |
+| **Hostile / damaged XML**: XXE entities, DTDs, oversized text nodes, truncation, UTF-16 | entity resolution off, `no_network`, `huge_tree`, loud recovery-mode retry |
+
+SSIS pipeline `dataType` values are normalized (`i4` → `DT_I4`) by
+`normalize_ssis_type()` in
 [`cir/type_mapping.py`](../ssis_migration/cir/type_mapping.py) before type
 resolution.
 
