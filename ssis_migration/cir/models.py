@@ -338,6 +338,10 @@ class CIRMetadata(BaseModel):
     parser_version: str = "0.1.0"
     complexity_score: ComplexityLevel = ComplexityLevel.SIMPLE
     complexity_details: ComplexityDetails = Field(default_factory=ComplexityDetails)
+    # DTSX→CIR structural capture, recorded at parse time so canonical-stage
+    # completeness is auditable without re-reading the source file:
+    # {"coverage": 0.97, "detail": {category: {"dtsx": n, "cir": m, "coverage": r}}}
+    parse_coverage: dict[str, Any] | None = None
 
 
 class CIR(BaseModel):

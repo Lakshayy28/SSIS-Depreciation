@@ -55,13 +55,52 @@ _JDBC_DRIVER_MAP: list[tuple[re.Pattern[str], str, str]] = [
      "org.postgresql.Driver"),
 ]
 
-# Simple extraction patterns for connection string key=value pairs
-_CONN_STRING_RE = re.compile(r'(?P<key>[^;=\s]+)\s*=\s*(?P<value>[^;]+)', re.I)
+# key=value pairs; keys may contain spaces ("Data Source", "Initial Catalog",
+# "User ID") so only ';' and '=' terminate a key.
+_CONN_STRING_RE = re.compile(r'(?P<key>[^;=]+?)\s*=\s*(?P<value>[^;]*)', re.I)
 
 
 def _parse_connection_string(cs: str) -> dict[str, str]:
     return {m.group("key").strip().lower(): m.group("value").strip()
-            for m in _CONN_STRING_RE.finditer(cs)}
+            for m in _CONN_STRING_RE.finditer(cs)
+            if m.group("key").strip()}
+
+
+# OLE DB / ADO.NET connection-string keys → the canonical keys the codegen and
+# LLM prompts document (host, port, database, user, password).
+_CANONICAL_KEY_ALIASES: dict[str, str] = {
+    "data source": "host",
+    "server": "host",
+    "address": "host",
+    "initial catalog": "database",
+    "database": "database",
+    "user id": "user",
+    "uid": "user",
+    "password": "password",
+    "pwd": "password",
+}
+
+
+def _normalize_conn_params(params: dict[str, str]) -> dict[str, str]:
+    """Add canonical host/port/database/user/password aliases alongside the raw keys."""
+    out = dict(params)
+    for raw_key, canonical in _CANONICAL_KEY_ALIASES.items():
+        if raw_key in params and canonical not in out:
+            value = params[raw_key]
+            # "Data Source=server,1433" / "server:1433" carry the port inline
+            if canonical == "host":
+                for sep in (",", ":"):
+                    if sep in value:
+                        host, _, port = value.partition(sep)
+                        out["host"] = host.strip()
+                        if port.strip().isdigit() and "port" not in out:
+                            out["port"] = port.strip()
+                        break
+                else:
+                    out["host"] = value
+            else:
+                out[canonical] = value
+    return out
 
 
 def _infer_target(provider_type: str, cs: str) -> ConnectionTargetMapping | None:
@@ -105,15 +144,16 @@ class ConnectionExtractor:
         for cm_el in managers_el.findall(DTS_CONNECTION_MANAGER):
             name = cm_el.get(ATTR_OBJECT_NAME) or cm_el.get(ATTR_NAME, "")
             creation_name = cm_el.get(ATTR_CREATION_NAME, "").upper()
+
             # ConnectionString may be on the outer element OR in a nested
-        # DTS:ObjectData/DTS:ConnectionManager element (common in SSIS 2012+)
-        cs = cm_el.get(ATTR_CONNECTION_STRING, "")
-        if not cs:
-            obj_data = cm_el.find(f"{{{DTS}}}ObjectData")
-            if obj_data is not None:
-                inner = obj_data.find(DTS_CONNECTION_MANAGER)
-                if inner is not None:
-                    cs = inner.get(ATTR_CONNECTION_STRING, "")
+            # DTS:ObjectData/DTS:ConnectionManager element (common in SSIS 2012+)
+            cs = cm_el.get(ATTR_CONNECTION_STRING, "")
+            if not cs:
+                obj_data = cm_el.find(f"{{{DTS}}}ObjectData")
+                if obj_data is not None:
+                    inner = obj_data.find(DTS_CONNECTION_MANAGER)
+                    if inner is not None:
+                        cs = inner.get(ATTR_CONNECTION_STRING, "")
 
             provider_type = "unknown"
             for prefix, canonical in _PROVIDER_MAP.items():
@@ -121,7 +161,7 @@ class ConnectionExtractor:
                     provider_type = canonical
                     break
 
-            resolved = _parse_connection_string(cs)
+            resolved = _normalize_conn_params(_parse_connection_string(cs))
             target = _infer_target(provider_type, cs)
 
             results.append(

@@ -115,10 +115,16 @@ def count_dtsx_elements(dtsx_path: Path | str) -> dict[str, int]:
         1 for e in root.iter()
         if isinstance(e.tag, str) and e.tag.rsplit("}", 1)[-1] == "component"
     )
+    # Count only connection managers in ConnectionManagers collections — each
+    # manager also nests an inner DTS:ConnectionManager under DTS:ObjectData,
+    # which must not be double-counted.
+    connections = len(
+        root.findall(f".//{ns.DTS_CONNECTION_MANAGERS}/{ns.DTS_CONNECTION_MANAGER}")
+    )
     return {
         "executables": len(root.findall(f".//{ns.DTS_EXECUTABLE}")),
         "dataflow_components": dataflow_components,
-        "connections": len(root.findall(f".//{ns.DTS_CONNECTION_MANAGER}")),
+        "connections": connections,
         "parameters": len(root.findall(f".//{ns.DTS_PARAMETER}")),
         "variables": len(root.findall(f".//{ns.DTS_VARIABLE}")),
     }

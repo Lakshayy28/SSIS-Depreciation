@@ -128,6 +128,43 @@ def map_executable_type(raw_type: str) -> str:
     return raw_type.split(".")[-1].lower()
 
 
+# Logical component class names (modern DTSX writes these instead of GUIDs)
+LOGICAL_COMPONENT_MAP: dict[str, str] = {
+    "microsoft.oledbsource": "oledb_source",
+    "microsoft.oledbdestination": "oledb_destination",
+    "microsoft.flatfilesource": "flat_file_source",
+    "microsoft.flatfiledestination": "flat_file_destination",
+    "microsoft.derivedcolumn": "derived_column",
+    "microsoft.conditionalsplit": "conditional_split",
+    "microsoft.lookup": "lookup",
+    "microsoft.mergejoin": "merge_join",
+    "microsoft.merge": "merge_join",
+    "microsoft.sort": "sort",
+    "microsoft.aggregate": "aggregate",
+    "microsoft.unionall": "union_all",
+    "microsoft.multicast": "multicast",
+    "microsoft.dataconvert": "data_conversion",
+    "microsoft.copycolumn": "copy_column",
+    "microsoft.rowcount": "row_count",
+    "microsoft.charactermap": "character_map",
+    "microsoft.scd": "slowly_changing_dimension",
+    "microsoft.fuzzylookup": "fuzzy_lookup",
+    "microsoft.pivot": "pivot",
+    "microsoft.unpivot": "unpivot",
+    "microsoft.xmlsourceadapter": "xml_source",
+    "microsoft.adonetsource": "ado_net_source",
+    "microsoft.adonetdestination": "ado_net_destination",
+    "microsoft.managedcomponenthost": "script_component",
+    "microsoft.scriptcomponent": "script_component",
+    "microsoft.oledbcommand": "oledb_command",
+}
+
+
 def map_component_class(class_id: str) -> str:
-    """Map SSIS component classID GUID to CIR subtype."""
-    return COMPONENT_CLASS_MAP.get(class_id.upper(), "unknown_component")
+    """Map SSIS component classID (GUID or logical name) to CIR subtype."""
+    if not class_id:
+        return "unknown_component"
+    guid_hit = COMPONENT_CLASS_MAP.get(class_id.upper())
+    if guid_hit:
+        return guid_hit
+    return LOGICAL_COMPONENT_MAP.get(class_id.lower(), "unknown_component")

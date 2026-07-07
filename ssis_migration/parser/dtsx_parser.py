@@ -116,6 +116,31 @@ class DTSXParser:
             conversion_metadata=ConversionMetadata(),
         )
 
+        # ── Canonical-completeness audit ──────────────────────────────────
+        # Compare what the raw DTSX contains vs what landed in the CIR and
+        # record it on the CIR itself, so any capture loss is visible (and
+        # scored) instead of silent.
+        try:
+            from ssis_migration.scoring import (
+                count_cir_elements,
+                count_dtsx_elements,
+                structural_coverage,
+            )
+            coverage, detail = structural_coverage(
+                count_dtsx_elements(path), count_cir_elements(cir)
+            )
+            cir.metadata.parse_coverage = {"coverage": coverage, "detail": detail}
+            if coverage < 1.0:
+                dropped = {
+                    cat: d for cat, d in detail.items() if d["coverage"] < 1.0
+                }
+                logger.warning(
+                    "Canonical stage incomplete for %s: coverage=%.0f%% dropped=%s",
+                    path.name, coverage * 100, dropped,
+                )
+        except Exception as exc:  # pragma: no cover — audit must never break parsing
+            logger.debug("Parse-coverage audit skipped: %s", exc)
+
         logger.info(
             "Parsed %s: %d executables, %d data flows, complexity=%s",
             package_name,
@@ -128,19 +153,31 @@ class DTSXParser:
     def _extract_data_flows(
         self, root: etree._Element, control_flow: ControlFlow
     ) -> list[DataFlow]:
+        """
+        Find EVERY Data Flow Task in the package, no matter how deeply nested
+        inside Sequence / loop containers or event handlers. A non-recursive
+        scan here previously dropped whole data flows (and every component in
+        them) from the canonical stage.
+        """
         data_flows: list[DataFlow] = []
-        execs_el = root.find(DTS_EXECUTABLES)
-        if execs_el is None:
-            return data_flows
 
-        for exe_el in execs_el.findall(DTS_EXECUTABLE):
-            raw_type = exe_el.get(ATTR_EXECUTABLE_TYPE, "")
+        from ssis_migration.parser.ns import ATTR_CREATION_NAME
+
+        for exe_el in root.iterfind(f".//{DTS_EXECUTABLE}"):
+            # The task type may be in ExecutableType (classic) or CreationName
+            # (SSIS 2012+ project-deployment packages).
+            raw_type = (
+                exe_el.get(ATTR_EXECUTABLE_TYPE)
+                or exe_el.get(ATTR_CREATION_NAME)
+                or ""
+            )
             if map_executable_type(raw_type) != "data_flow":
                 continue
 
             name = exe_el.get(_ATTR_NAME, "")
             obj_data = exe_el.find(DTS_OBJECT_DATA)
             if obj_data is None:
+                logger.warning("Data flow '%s' has no ObjectData — skipped", name)
                 continue
 
             # Find the matching control_flow executable to get its generated id
@@ -150,15 +187,26 @@ class DTSXParser:
             try:
                 df = extractor.extract()
                 data_flows.append(df)
+                if not df.components:
+                    logger.warning("Data flow '%s' parsed with 0 components", name)
             except Exception as exc:
                 logger.warning("Failed to extract data flow '%s': %s", name, exc)
 
         return data_flows
 
     def _find_df_id(self, control_flow: ControlFlow, name: str) -> str:
-        for exe in control_flow.execution_tree:
-            if exe.name == name and exe.data_flow_ref:
-                return exe.data_flow_ref
+        def _walk(exes) -> str | None:
+            for exe in exes:
+                if exe.name == name and exe.data_flow_ref:
+                    return exe.data_flow_ref
+                found = _walk(exe.children)
+                if found:
+                    return found
+            return None
+
+        hit = _walk(control_flow.execution_tree)
+        if hit:
+            return hit
         # Fallback: generate a stable id from the name
         safe = "".join(c if c.isalnum() else "_" for c in name.lower())
         return f"df_{safe}"

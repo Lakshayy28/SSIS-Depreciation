@@ -54,9 +54,24 @@ KNOWN_DIVERGENCES: dict[str, str] = {
 }
 
 
+def normalize_ssis_type(raw: str) -> str:
+    """
+    Normalize a DTSX pipeline dataType to the canonical DT_* name.
+
+    Modern DTSX pipeline XML writes lowercase pipeline names ("i4", "wstr",
+    "dbTimeStamp", "numeric") while older packages and most documentation use
+    the DT_* enum ("DT_I4"). Accept both.
+    """
+    if not raw:
+        return "DT_WSTR"
+    if raw.upper().startswith("DT_"):
+        return raw.upper()
+    return f"DT_{raw.upper()}"
+
+
 def resolve_type(ssis_type: str, precision: int | None = None, scale: int | None = None) -> tuple[str, str, str | None]:
     """Return (cir_type, pyspark_type, divergence_note)."""
-    key = ssis_type.upper()
+    key = normalize_ssis_type(ssis_type)
     if key not in SSIS_TYPE_MAP:
         return ("unknown", "StringType", f"Unrecognised SSIS type '{ssis_type}'; defaulted to StringType")
 
