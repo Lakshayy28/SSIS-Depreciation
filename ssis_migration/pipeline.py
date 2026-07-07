@@ -195,8 +195,8 @@ class MigrationPipeline:
                     logger.info("[3/5] LLM skipped (%s)",
                                 "0 LLM_REQUIRED items" if not has_llm_items else "no LLM pipeline")
 
-                # Phase 4: generate code
-                paths = self._codegen(cir, result, dtsx_path)
+                # Phase 4: generate code (with whole-file compile gate)
+                paths = self._codegen(cir, result, dtsx_path, llm_pipeline)
                 if paths is None:
                     return result
 
@@ -259,18 +259,49 @@ class MigrationPipeline:
                     "SUCCESS" if result.success else "ISSUES FOUND")
         return result
 
-    def _codegen(self, cir: CIR, result: PipelineResult, dtsx_path: Path) -> dict | None:
+    def _codegen(
+        self, cir: CIR, result: PipelineResult, dtsx_path: Path, llm_pipeline=None,
+    ) -> dict | None:
         """Run code generation, populate result.module_path/test_path. Returns paths or None on error."""
         try:
             paths = self._generator.generate(cir)
             result.module_path = paths["module"]
             result.test_path = paths["test"]
             logger.info("[4/5] Code generation complete: %s", paths["module"])
-            return paths
         except Exception as exc:
             result.error = f"Code generation failed: {exc}"
             logger.error("Code generation failed: %s", exc)
             return None
+
+        # WHOLE-FILE COMPILE GATE — the final module must be importable Python.
+        # Deterministic repair always runs; the LLM syntax editor joins in when
+        # a pipeline (and therefore a token) is available.
+        try:
+            from ssis_migration.config import cfg
+            from ssis_migration.transform.llm.repair import ensure_compilable, syntax_error
+
+            source = result.module_path.read_text(encoding="utf-8")
+            if syntax_error(source) is not None:
+                repair = ensure_compilable(
+                    source,
+                    fixer=getattr(llm_pipeline, "fixer", None),
+                    max_llm_fixes=cfg.syntax_fix_max_iterations,
+                    label=result.module_path.name,
+                )
+                if repair.ok and repair.code.strip():
+                    result.module_path.write_text(repair.code, encoding="utf-8")
+                    logger.info(
+                        "[4/5] Whole-file syntax repair succeeded (%s)",
+                        " → ".join(repair.stages) or "normalization",
+                    )
+                else:
+                    logger.error(
+                        "[4/5] Generated module STILL does not compile: %s", repair.error,
+                    )
+        except Exception as exc:
+            logger.warning("Whole-file compile gate errored (module left as-is): %s", exc)
+
+        return paths
 
     def _run_llm(
         self,

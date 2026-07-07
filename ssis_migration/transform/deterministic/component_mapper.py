@@ -99,16 +99,18 @@ class ComponentMapper:
     # ── Sources ───────────────────────────────────────────────────────────────
 
     def _map_source(self, comp: DataFlowComponent, cir: CIR) -> None:
-        conn = self._conn_var(comp.connection_ref)
+        conn, resolved = self._conn_name(cir, comp.connection_ref, prefer="source")
+        note = self._verify_note(resolved, conn)
         if comp.sql_command:
             transpile_sql(comp.sql_command)
             if comp.sql_command.transpilation_status == TranspilationStatus.LLM_REQUIRED:
                 self._flag_llm(comp, cir, "Source SQL requires LLM transpilation")
                 return
-            sql_var = f'source_sql_{comp.id}'
+            sql_var = "source_sql"
             snippet = (
-                f'{sql_var} = """\n    {comp.sql_command.transpiled_text}\n"""\n'
-                f'df_{comp.id} = (\n'
+                f'{note}'
+                f'{sql_var} = """\n{comp.sql_command.transpiled_text}\n"""\n'
+                f'df = (\n'
                 f'    spark.read.format("jdbc")\n'
                 f'    .option("url", connections["{conn}"]["url"])\n'
                 f'    .option("driver", connections["{conn}"]["driver"])\n'
@@ -120,7 +122,8 @@ class ComponentMapper:
             # Table-mode access
             table = comp.table_name or "UNKNOWN_TABLE"
             snippet = (
-                f'df_{comp.id} = (\n'
+                f'{note}'
+                f'df = (\n'
                 f'    spark.read.format("jdbc")\n'
                 f'    .option("url", connections["{conn}"]["url"])\n'
                 f'    .option("driver", connections["{conn}"]["driver"])\n'
@@ -136,7 +139,7 @@ class ComponentMapper:
         delim = comp.delimiter or ","
         header = str(comp.has_header).lower()
         snippet = (
-            f'df_{comp.id} = (\n'
+            f'df = (\n'
             f'    spark.read.format("csv")\n'
             f'    .option("header", "{header}")\n'
             f'    .option("sep", "{delim}")\n'
@@ -150,11 +153,12 @@ class ComponentMapper:
     # ── Destinations ──────────────────────────────────────────────────────────
 
     def _map_destination(self, comp: DataFlowComponent, cir: CIR) -> None:
-        conn = self._conn_var(comp.connection_ref)
+        conn, resolved = self._conn_name(cir, comp.connection_ref, prefer="dest")
         table = comp.table_name or "UNKNOWN_TABLE"
         snippet = (
+            f'{self._verify_note(resolved, conn)}'
             f'(\n'
-            f'    df_input\n'
+            f'    df\n'
             f'    .write.format("jdbc")\n'
             f'    .option("url", connections["{conn}"]["url"])\n'
             f'    .option("driver", connections["{conn}"]["driver"])\n'
@@ -170,7 +174,7 @@ class ComponentMapper:
         path = comp.file_path or "UNKNOWN_PATH"
         snippet = (
             f'(\n'
-            f'    df_input\n'
+            f'    df\n'
             f'    .write.format("csv")\n'
             f'    .option("header", "true")\n'
             f'    .mode("overwrite")\n'
@@ -183,7 +187,7 @@ class ComponentMapper:
     # ── Transformations ───────────────────────────────────────────────────────
 
     def _map_derived_column(self, comp: DataFlowComponent, cir: CIR) -> None:
-        lines = ["df = df  # Derived Column"]
+        lines = [f"# Derived Column: {comp.name}"]
         all_deterministic = True
         for expr_node in comp.expressions:
             translate_expression_node(expr_node)
@@ -222,26 +226,31 @@ class ComponentMapper:
         )
 
     def _map_lookup(self, comp: DataFlowComponent, cir: CIR) -> None:
-        conn = self._conn_var(comp.connection_ref)
+        if not comp.lookup_sql:
+            self._flag_llm(comp, cir, "Lookup has no reference SQL — cache-connection lookups need LLM")
+            return
+
+        conn, _resolved = self._conn_name(cir, comp.connection_ref, prefer="source")
         join_keys = [f'"{j.input}"' for j in comp.join_columns]
         join_cols_str = f"[{', '.join(join_keys)}]" if join_keys else '"key"'
 
-        lookup_load = ""
-        if comp.lookup_sql:
-            lookup_load = (
-                f'lookup_df_{comp.id} = (\n'
-                f'    spark.read.format("jdbc")\n'
-                f'    .option("url", connections["{conn}"]["url"])\n'
-                f'    .option("query", """{comp.lookup_sql}""")\n'
-                f'    .load()\n'
-                f')'
-            )
+        lookup_load = (
+            f'lookup_df = (\n'
+            f'    spark.read.format("jdbc")\n'
+            f'    .option("url", connections["{conn}"]["url"])\n'
+            f'    .option("driver", connections["{conn}"]["driver"])\n'
+            f'    .option("query", """{comp.lookup_sql}""")\n'
+            f'    .load()\n'
+            f')'
+        )
 
-        how = "left"  # Lookup in SSIS is a left join equivalent
-        broadcast = "F.broadcast(lookup_df)" if comp.cache_mode == CacheMode.NONE else "lookup_df"
+        how = "left"  # SSIS Lookup ≈ left join
+        # SSIS full-cache lookup pulls the reference table into memory — the
+        # Spark analog is a broadcast join. No-cache lookups stay shuffle joins.
+        right = "F.broadcast(lookup_df)" if comp.cache_mode == CacheMode.FULL else "lookup_df"
         snippet = (
             f'{lookup_load}\n'
-            f'df = df.join({broadcast}_{comp.id}, on={join_cols_str}, how="{how}")'
+            f'df = df.join({right}, on={join_cols_str}, how="{how}")'
         )
         comp.pyspark_snippet = snippet
         comp.conversion_status = ConversionStatus.DETERMINISTIC
@@ -255,16 +264,24 @@ class ComponentMapper:
         comp.conversion_status = ConversionStatus.DETERMINISTIC
 
     def _map_aggregate(self, comp: DataFlowComponent) -> None:
+        # group-by columns arrive as aggregation entries with function=group_by
         group_cols = [f'"{c}"' for c in comp.group_by_columns]
         agg_calls = []
         for agg in comp.aggregations:
-            func = _AGG_FUNC.get(agg.get("function", ""), "F.count")
+            func_name = agg.get("function", "")
             col = agg.get("column", "col")
+            src = agg.get("source") or col
+            if func_name == "group_by":
+                quoted = f'"{col}"'
+                if quoted not in group_cols:
+                    group_cols.append(quoted)
+                continue
+            func = _AGG_FUNC.get(func_name)
             if func:
-                agg_calls.append(f'{func}("{col}").alias("{col}")')
+                agg_calls.append(f'{func}("{src}").alias("{col}")')
 
-        group_str = f"[{', '.join(group_cols)}]" if group_cols else ""
-        agg_str = ", ".join(agg_calls) if agg_calls else 'F.count("*").alias("count")'
+        group_str = ", ".join(group_cols)
+        agg_str = ", ".join(agg_calls) if agg_calls else 'F.count("*").alias("row_count")'
         snippet = f'df = df.groupBy({group_str}).agg({agg_str})'
         comp.pyspark_snippet = snippet
         comp.conversion_status = ConversionStatus.DETERMINISTIC
@@ -277,7 +294,16 @@ class ComponentMapper:
         comp.conversion_status = ConversionStatus.DETERMINISTIC
 
     def _map_union_all(self, comp: DataFlowComponent) -> None:
-        snippet = 'df = df1.unionByName(df2, allowMissingColumns=True)'
+        from ssis_migration.config import cfg
+        try:
+            major, minor = (int(x) for x in cfg.spark_version.split(".")[:2])
+        except ValueError:
+            major, minor = 3, 3
+        # allowMissingColumns is Spark 3.1+; older targets get the plain form.
+        if (major, minor) >= (3, 1):
+            snippet = 'df = df_branch_1.unionByName(df_branch_2, allowMissingColumns=True)'
+        else:
+            snippet = 'df = df_branch_1.unionByName(df_branch_2)'
         comp.pyspark_snippet = snippet
         comp.conversion_status = ConversionStatus.DETERMINISTIC
 
@@ -287,7 +313,7 @@ class ComponentMapper:
         comp.conversion_status = ConversionStatus.DETERMINISTIC
 
     def _map_row_count(self, comp: DataFlowComponent) -> None:
-        snippet = f'row_count_{comp.id} = df.count()'
+        snippet = 'row_count = df.count()\nlogger.info("Row count: %d", row_count)'
         comp.pyspark_snippet = snippet
         comp.conversion_status = ConversionStatus.DETERMINISTIC
 
@@ -302,10 +328,14 @@ class ComponentMapper:
         lines = []
         for col in comp.output_columns:
             if col.pyspark_type:
+                # pyspark_type is either bare ("IntegerType") or parameterised
+                # ("DecimalType(18,4)") — only bare names need call parens.
+                type_expr = col.pyspark_type if col.pyspark_type.endswith(")") \
+                    else f"{col.pyspark_type}()"
                 lines.append(
-                    f'df = df.withColumn("{col.name}", F.col("{col.name}").cast({col.pyspark_type}()))'
+                    f'df = df.withColumn("{col.name}", F.col("{col.name}").cast({type_expr}))'
                 )
-        comp.pyspark_snippet = "\n".join(lines) or "# Data Conversion"
+        comp.pyspark_snippet = "\n".join(lines) or "# Data Conversion (no typed output columns)"
         comp.conversion_status = ConversionStatus.DETERMINISTIC
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -316,11 +346,34 @@ class ComponentMapper:
         cir.flag_for_llm(comp.id)
         logger.debug("Component %s flagged for LLM: %s", comp.id, reason)
 
-    def _conn_var(self, conn_ref: str | None) -> str:
-        if not conn_ref:
-            return "default"
-        import re
-        return re.sub(r'[^a-z0-9]+', '_', (conn_ref or "").lower()).strip('_')
+    def _conn_name(self, cir: CIR, conn_ref: str | None,
+                   prefer: str | None = None) -> tuple[str, bool]:
+        """
+        Resolve a component's connection ref to the connection-manager NAME
+        (the generated module's CONNECTIONS dict is keyed by name).
+
+        Returns (name, resolved). When the DTSX component carries no usable
+        ref, we guess: prefer a connection whose name hints at the role
+        ("dest"/"source"), else the first one — and the caller emits a
+        verify-me comment so the guess is never silent.
+        """
+        conn = cir.find_connection(conn_ref)
+        if conn is not None:
+            return conn.name, True
+        if cir.connections:
+            if prefer:
+                for c in cir.connections:
+                    if prefer.lower() in c.name.lower():
+                        return c.name, False
+            return cir.connections[0].name, False
+        return conn_ref or "default", False
+
+    @staticmethod
+    def _verify_note(resolved: bool, conn: str) -> str:
+        if resolved:
+            return ""
+        return (f"# TODO(verify): DTSX component specified no connection manager — "
+                f"defaulted to '{conn}'; confirm before running\n")
 
     def _update_coverage(self, cir: CIR) -> None:
         total = sum(len(df.components) for df in cir.data_flows)

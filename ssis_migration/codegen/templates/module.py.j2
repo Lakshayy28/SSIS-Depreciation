@@ -10,6 +10,9 @@ Human review required: {{ conversion_metadata.human_review_required|length }}
 
 from __future__ import annotations
 
+import logging
+from typing import Optional
+
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -19,30 +22,46 @@ from pyspark.sql.types import (
     TimestampType, DateType, BooleanType, BinaryType, NullType,
 )
 from pyspark.sql.window import Window
-import logging
 
 logger = logging.getLogger(__name__)
 
 
 # ─── CONNECTION CONFIGURATION ─────────────────────────────────────────────────
-CONNECTIONS: dict[str, dict] = {
+# Keyed by SSIS connection-manager NAME (what generated code looks up).
+# Passwords are never emitted — inject them at runtime from a secret store.
+CONNECTIONS = {
 {% for conn in connections %}
-    "{{ conn.id }}": {
-        "name": "{{ conn.name }}",
+    "{{ conn.name }}": {
+        "id": "{{ conn.id }}",
         "type": "{{ conn.provider_type }}",
+{% if conn.resolved_parameters.get('host') %}
+        "host": "{{ conn.resolved_parameters.get('host') }}",
+{% endif %}
+{% if conn.resolved_parameters.get('port') %}
+        "port": "{{ conn.resolved_parameters.get('port') }}",
+{% endif %}
+{% if conn.resolved_parameters.get('database') %}
+        "database": "{{ conn.resolved_parameters.get('database') }}",
+{% endif %}
+{% if conn.resolved_parameters.get('user') %}
+        "user": "{{ conn.resolved_parameters.get('user') }}",
+{% endif %}
+        "password": "",   # supply at runtime (env var / secret manager)
 {% if conn.target_mapping %}
         "url": "{{ conn.target_mapping.url_template or '' }}",
         "driver": "{{ conn.target_mapping.driver or '' }}",
-        "format": "{{ conn.target_mapping.format or '' }}",
+{% if conn.target_mapping.format %}
+        "format": "{{ conn.target_mapping.format }}",
 {% endif %}
-        "options": {},   # Populated at runtime from environment / config
+{% endif %}
+        "options": {},    # extra reader/writer options, populated at runtime
     },
 {% endfor %}
 }
 
 
 # ─── PARAMETERS ───────────────────────────────────────────────────────────────
-DEFAULT_PARAMS: dict[str, object] = {
+DEFAULT_PARAMS = {
 {% for param in parameters %}
     "{{ param.name }}": {{ param.default_value|tojson if param.default_value is not none else "None" }},  # {{ param.data_type }}
 {% endfor %}
@@ -50,61 +69,85 @@ DEFAULT_PARAMS: dict[str, object] = {
 
 
 # ─── VARIABLES ────────────────────────────────────────────────────────────────
-_PACKAGE_VARS: dict[str, object] = {
+_PACKAGE_VARS = {
 {% for var in variables %}
     "{{ var.name }}": {{ var.default_value|tojson if var.default_value is not none else "None" }},
 {% endfor %}
 }
 
+{% macro human_review_banner(name, kind, reason, source, indent_str) %}
+{{ indent_str }}# ╔═══ HUMAN REVIEW REQUIRED ══════════════════════════════════════════════
+{{ indent_str }}# ║ Item   : {{ name }} [{{ kind }}]
+{{ indent_str }}# ║ Reason : {{ reason }}
+{% if source %}
+{{ indent_str }}# ║ Original SSIS source (excerpt):
+{% for line in source.strip().splitlines()[:8] %}
+{{ indent_str }}# ║   {{ line.rstrip() }}
+{% endfor %}
+{% if source.strip().splitlines()|length > 8 %}
+{{ indent_str }}# ║   … ({{ source.strip().splitlines()|length - 8 }} more lines — see CIR / hybrid manifest)
+{% endif %}
+{% endif %}
+{{ indent_str }}# ╚════════════════════════════════════════════════════════════════════════
+{%- endmacro %}
 {% for df in data_flows %}
 
 # ─── DATA FLOW: {{ df.name }} ─────────────────────────────────────────────────
 def {{ df.name | python_identifier }}(
     spark: SparkSession,
-    params: dict | None = None,
-    connections: dict | None = None,
+    params: Optional[dict] = None,
+    connections: Optional[dict] = None,
 ) -> DataFrame:
     params = params or DEFAULT_PARAMS
     connections = connections or CONNECTIONS
+    df = None  # running DataFrame through the component chain
 
 {% for comp in df.components %}
     # ── {{ comp.name }} ({{ comp.subtype }}) ──────────────────────────────────
 {% if comp.pyspark_snippet %}
-{{ comp.pyspark_snippet | indent(4) }}
+{{ comp.pyspark_snippet | indent(4, true) }}
+{% elif comp.conversion_status.value == "human_review" %}
+{{ human_review_banner(comp.name, comp.subtype, comp.conversion_notes or "no snippet generated", (comp.sql_command.original_text if comp.sql_command else comp.script_code) or "", "    ") }}
+    logger.warning("HUMAN REVIEW: component '{{ comp.name }}' is not implemented")
 {% else %}
-    # TODO: {{ comp.name }} ({{ comp.subtype }}) — {{ comp.conversion_notes or "no snippet generated" }}
-    pass
+{{ human_review_banner(comp.name, comp.subtype, comp.conversion_notes or "component produced no snippet (status: " ~ comp.conversion_status.value ~ ")", (comp.sql_command.original_text if comp.sql_command else comp.script_code) or "", "    ") }}
+    logger.warning("HUMAN REVIEW: component '{{ comp.name }}' is not implemented")
 {% endif %}
 {% endfor %}
 
-    return df  # noqa: F821 — df is the last DataFrame in the pipeline chain
+    if df is None:
+        raise NotImplementedError(
+            "Data flow '{{ df.name }}' has unimplemented components — see HUMAN REVIEW comments above"
+        )
+    return df
 {% endfor %}
 
+{% macro render_exe(exe, depth) %}
+{% set ind = "    " %}
+    # Step: {{ exe.name }} [{{ exe.type }}]{% if depth > 0 %} (nested level {{ depth }}){% endif %}
 
-# ─── CONTROL FLOW ─────────────────────────────────────────────────────────────
-def run_package(
-    spark: SparkSession,
-    params: dict | None = None,
-    connections: dict | None = None,
-) -> None:
-    """
-    Package entry point: {{ metadata.source_file }}
-    Execution order is derived from SSIS precedence constraints.
-    """
-    params = params or DEFAULT_PARAMS
-    connections = connections or CONNECTIONS
-
-{% for exe in control_flow.execution_tree %}{% set step_num = loop.index0 %}
-    # Step {{ step_num + 1 }}: {{ exe.name }} [{{ exe.type }}]
-{% if exe.type == "execute_sql" and exe.sql %}
+{% if exe.type == "sequence" %}
+    logger.info("Sequence container: {{ exe.name }}")
+{% for child in exe.children %}{{ render_exe(child, depth + 1) }}{% endfor %}
+{% elif exe.type in ("for_loop", "foreach_loop") %}
+{{ human_review_banner(exe.name, exe.type, "loop container — verify iteration semantics (" ~ (exe.loop_eval_expression or exe.loop_variable or "no loop metadata") ~ ")", "", "    ") }}
+    logger.warning("HUMAN REVIEW: loop '{{ exe.name }}' children execute ONCE below; wrap in the intended loop")
+{% for child in exe.children %}{{ render_exe(child, depth + 1) }}{% endfor %}
+{% elif exe.type == "execute_sql" and exe.sql %}
     logger.info("Executing: {{ exe.name }}")
-{% if exe.sql.transpiled_text %}
-    spark.sql("""
-{{ exe.sql.transpiled_text | indent(4) }}
-    """)
+{% if exe.pyspark_snippet %}
+{{ exe.pyspark_snippet | indent(4, true) }}
+{% elif exe.sql.transpiled_text and exe.conversion_status.value != "human_review" %}
+{% if exe.sql.transpiled_text.strip().startswith(("spark.", "import", "from", "#", "def ", "conn", "with ", "for ", "if ", "params", "cursor", "result", "_")) or "=" in exe.sql.transpiled_text.split("\n")[0] %}
+{{ exe.sql.transpiled_text | indent(4, true) }}
 {% else %}
-    # TODO ({{ exe.sql.transpilation_status.value }}): {{ exe.sql.original_text | truncate(100) }}
-    pass
+    spark.sql("""
+{{ exe.sql.transpiled_text | indent(8, true) }}
+    """)
+{% endif %}
+{% else %}
+{{ human_review_banner(exe.name, "execute_sql", exe.conversion_notes or ("SQL not converted (status: " ~ exe.sql.transpilation_status.value ~ ")"), exe.sql.original_text, "    ") }}
+    logger.warning("HUMAN REVIEW: SQL step '{{ exe.name }}' is not implemented")
 {% endif %}
 {% elif exe.type == "data_flow" and exe.data_flow_ref %}
     logger.info("Executing data flow: {{ exe.name }}")
@@ -114,19 +157,36 @@ def run_package(
 {% elif exe.type == "script_task" %}
     logger.info("Executing script task: {{ exe.name }}")
 {% if exe.pyspark_snippet %}
-{{ exe.pyspark_snippet | indent(4) }}
+{{ exe.pyspark_snippet | indent(4, true) }}
 {% else %}
-    # TODO ({{ exe.conversion_status.value }}): Script task — {{ exe.conversion_notes or "see human review log" }}
-    pass
+{{ human_review_banner(exe.name, "script_task", exe.conversion_notes or "script not converted", exe.script_code or "", "    ") }}
+    logger.warning("HUMAN REVIEW: script task '{{ exe.name }}' is not implemented")
 {% endif %}
 {% else %}
 {% if exe.pyspark_snippet %}
-{{ exe.pyspark_snippet | indent(4) }}
+{{ exe.pyspark_snippet | indent(4, true) }}
 {% else %}
-    # TODO: {{ exe.name }} ({{ exe.type }}) — not yet converted
-    pass
+{{ human_review_banner(exe.name, exe.type, exe.conversion_notes or "no converter for this task type", (exe.sql.original_text if exe.sql else exe.script_code) or "", "    ") }}
+    logger.warning("HUMAN REVIEW: step '{{ exe.name }}' ({{ exe.type }}) is not implemented")
 {% endif %}
 {% endif %}
+{%- endmacro %}
+
+# ─── CONTROL FLOW ─────────────────────────────────────────────────────────────
+def run_package(
+    spark: SparkSession,
+    params: Optional[dict] = None,
+    connections: Optional[dict] = None,
+) -> None:
+    """
+    Package entry point: {{ metadata.source_file }}
+    Execution order is derived from SSIS precedence constraints.
+    """
+    params = params or DEFAULT_PARAMS
+    connections = connections or CONNECTIONS
+
+{% for exe in control_flow.execution_tree %}
+{{ render_exe(exe, 0) }}
 {% endfor %}
 
     logger.info("Package completed: {{ metadata.source_file }}")

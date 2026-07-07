@@ -423,6 +423,7 @@ class DataFlowExtractor:
                 props = _get_props(col_el)
                 agg_func = (
                     props.get("AggregationFunction")
+                    or col_el.get("aggregationType")
                     or col_el.get("aggregationFunction")
                     or props.get("aggregationType")
                     or "0"

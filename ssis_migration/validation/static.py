@@ -57,6 +57,7 @@ class StaticValidator:
         self._check_syntax(source, report, module_path)
         self._check_api_compat(source, report)
         self._check_antipatterns(source, report)
+        self._check_undefined_names(source, report)
         self._check_human_review_items(cir, report)
         self._check_column_refs(source, cir, report)
         self._add_divergences(cir, report)
@@ -82,10 +83,12 @@ class StaticValidator:
         if self._spark_version >= (3, 0):
             return  # All 3.x APIs are valid in 3.x targets
         for api in _SPARK3_ONLY:
-            if re.search(rf'\b{re.escape(api)}\b', source):
+            # Anchor to a method CALL — a bare word match flags comments and
+            # component names ("AGG Region Summary (aggregate)").
+            if re.search(rf'\.{re.escape(api)}\s*\(', source):
                 report.error(
                     "API_COMPAT",
-                    f"'{api}' is a PySpark 3.x-only API; not available in {'.'.join(str(v) for v in self._spark_version)}",
+                    f"'.{api}()' is a PySpark 3.x-only API; not available in {'.'.join(str(v) for v in self._spark_version)}",
                     stage="static",
                 )
 
@@ -93,6 +96,60 @@ class StaticValidator:
         for pattern, message in _ANTIPATTERNS.items():
             if re.search(pattern, source):
                 report.warn("ANTIPATTERN", message, stage="static")
+
+    def _check_undefined_names(self, source: str, report: ValidationReport) -> None:
+        """
+        Flag names that are READ somewhere in the module but never defined by
+        any assignment, import, def/class, parameter, or comprehension in the
+        module. Coarse (module-wide union of definitions, so no scope-order
+        errors are caught) but zero-false-positive on correct code, and it
+        catches the classic LLM failure of calling a helper that was never
+        emitted (NameError at runtime).
+        """
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return  # syntax check already reported
+
+        import builtins
+        defined: set[str] = set(dir(builtins)) | {"__name__", "__file__", "__doc__"}
+        used: dict[str, int] = {}
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    args = node.args
+                    for a in (args.args + args.posonlyargs + args.kwonlyargs):
+                        defined.add(a.arg)
+                    if args.vararg:
+                        defined.add(args.vararg.arg)
+                    if args.kwarg:
+                        defined.add(args.kwarg.arg)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.Name):
+                if isinstance(node.ctx, ast.Store):
+                    defined.add(node.id)
+                elif isinstance(node.ctx, ast.Load):
+                    used.setdefault(node.id, node.lineno)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+            elif isinstance(node, (ast.comprehension,)):
+                for t in ast.walk(node.target):
+                    if isinstance(t, ast.Name):
+                        defined.add(t.id)
+
+        undefined = {n: ln for n, ln in used.items() if n not in defined}
+        for name, lineno in sorted(undefined.items(), key=lambda kv: kv[1])[:5]:
+            report.error(
+                "UNDEFINED_NAME",
+                f"Name '{name}' is used (line {lineno}) but never defined in the module "
+                "— will raise NameError at runtime",
+                stage="static",
+                location=f"line {lineno}",
+            )
 
     def _check_human_review_items(self, cir: CIR, report: ValidationReport) -> None:
         for item_id in cir.conversion_metadata.human_review_required:

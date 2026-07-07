@@ -66,7 +66,9 @@ class LLMPipeline:
         # so memory (symbols, pitfalls) accumulates over the whole conversion.
         self.memory = AgentMemory(facts={"spark_version": spark_version})
         self.manifest = AssemblyManifest(package="", spark_version=spark_version)
-        self._fixer = SyntaxFixer(self._client, spark_version=spark_version)
+        # Public: the main pipeline reuses this fixer for the whole-file gate.
+        self.fixer = SyntaxFixer(self._client, spark_version=spark_version)
+        self._fixer = self.fixer
 
         reviewer = ReviewAgent(self._client, reviewer_model=_reviewer_model)
         self._script_agent = ScriptTaskAgent(

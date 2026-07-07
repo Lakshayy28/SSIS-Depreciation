@@ -376,6 +376,20 @@ class CIR(BaseModel):
         raw = Path(path).read_text(encoding="utf-8")
         return cls.model_validate(json.loads(raw))
 
+    def find_connection(self, ref: str | None) -> "CIRConnection | None":
+        """Resolve a connection reference (id, name, or a DTSX refId like
+        'Package.ConnectionManagers[Name]') to the CIRConnection."""
+        if not ref:
+            return None
+        needle = ref.lower()
+        for conn in self.connections:
+            if conn.id.lower() == needle or conn.name.lower() == needle:
+                return conn
+        for conn in self.connections:
+            if conn.name and conn.name.lower() in needle:
+                return conn
+        return None
+
     def flag_for_llm(self, item_id: str) -> None:
         if item_id not in self.conversion_metadata.llm_required_items:
             self.conversion_metadata.llm_required_items.append(item_id)
