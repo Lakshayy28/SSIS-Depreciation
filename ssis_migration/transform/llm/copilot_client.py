@@ -73,6 +73,30 @@ def _mask_sensitive(obj: Any) -> Any:
     return obj
 
 
+def stitch_continuation(first: str, second: str, max_overlap: int = 400) -> str:
+    """
+    Join a truncated completion with its continuation, removing duplication.
+
+    Models asked to "continue" often repeat the tail of their previous output
+    (typically the interrupted line) and sometimes open a fresh markdown fence.
+    We drop a leading fence line, then remove the longest suffix of ``first``
+    that ``second`` starts with (checked up to ``max_overlap`` chars).
+    """
+    if not second:
+        return first
+    # Drop a leading code fence the continuation may have opened.
+    stripped = second.lstrip("\n")
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[1] if "\n" in stripped else ""
+    second = stripped
+
+    limit = min(len(first), len(second), max_overlap)
+    for size in range(limit, 0, -1):
+        if first.endswith(second[:size]):
+            return first + second[size:]
+    return first + second
+
+
 def _write_log(entry: dict[str, Any]) -> None:
     try:
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -295,18 +319,95 @@ class CopilotClient:
             finish_reason=choices[0].get("finish_reason", "stop"),
         )
 
-    def simple_complete(self, system_prompt: str, user_message: str, model: str | None = None) -> str:
-        """Convenience wrapper returning just the completion text.
-
-        model: override the instance model for this single call (used so the
-               ReviewAgent can use a stronger model than the generator).
+    def simple_complete(
+        self,
+        system_prompt: str,
+        user_message: str,
+        model: str | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         """
-        req = CompletionRequest(
-            messages=[
-                Message(role="system", content=system_prompt),
-                Message(role="user", content=user_message),
-            ],
-            model=model or "",  # empty string → use instance default in to_dict()
-        )
-        resp = self.complete(req)
+        Convenience wrapper returning just the completion text, hardened against
+        the two failure shapes that produce broken code downstream:
+
+        - EMPTY completions   → retried once, then raised (never returned as "").
+        - TRUNCATED completions (finish_reason == "length") → retried once with
+          a doubled token budget; if still truncated, a continuation request is
+          issued and the two halves are stitched (overlap-deduplicated).
+
+        model:      override the instance model for this single call (used so
+                    the reviewer/judges can use a different model).
+        max_tokens: per-call completion budget (None → instance default).
+        """
+        messages = [
+            Message(role="system", content=system_prompt),
+            Message(role="user", content=user_message),
+        ]
+        budget = max_tokens or self._max_tokens
+
+        resp = self._complete_once(messages, model, budget)
+
+        # Empty completion — one retry, then hard error (an empty snippet would
+        # otherwise sail through as "successfully converted" nothing).
+        if not resp.content.strip():
+            logger.warning("Empty completion from %s — retrying once", resp.model)
+            resp = self._complete_once(messages, model, budget)
+            if not resp.content.strip():
+                raise RuntimeError(
+                    f"Copilot returned an empty completion twice (model={resp.model})"
+                )
+
+        # Truncated completion — the top source of un-compilable generated code.
+        if resp.finish_reason == "length":
+            bigger = min(budget * 2, max(self._max_tokens * 2, 8192))
+            logger.warning(
+                "Completion truncated at %d tokens — retrying with budget=%d",
+                resp.completion_tokens, bigger,
+            )
+            retry = self._complete_once(messages, model, bigger)
+            if retry.content.strip() and retry.finish_reason != "length":
+                return retry.content
+            base = retry if retry.content.strip() else resp
+            logger.warning("Still truncated — requesting continuation and stitching")
+            return self._continue_completion(messages, model, bigger, base)
+
         return resp.content
+
+    def _complete_once(
+        self, messages: list[Message], model: str | None, max_tokens: int,
+    ) -> CompletionResponse:
+        req = CompletionRequest(
+            messages=list(messages),
+            model=model or "",     # empty string → instance default in to_dict()
+            max_tokens=max_tokens,
+        )
+        return self.complete(req)
+
+    def _continue_completion(
+        self,
+        messages: list[Message],
+        model: str | None,
+        max_tokens: int,
+        partial: CompletionResponse,
+    ) -> str:
+        """Ask the model to continue its truncated output and stitch the halves."""
+        cont_messages = list(messages) + [
+            Message(role="assistant", content=partial.content),
+            Message(
+                role="user",
+                content=(
+                    "Your previous response was cut off mid-output. Continue EXACTLY "
+                    "from where it stopped. Output ONLY the remaining text — do not "
+                    "repeat anything already produced, do not add explanations, do "
+                    "not open a new code fence."
+                ),
+            ),
+        ]
+        cont = self._complete_once(cont_messages, model, max_tokens)
+        stitched = stitch_continuation(partial.content, cont.content)
+        if cont.finish_reason == "length":
+            logger.warning(
+                "Continuation ALSO truncated — returning best-effort stitched output "
+                "(syntax repair layer will catch residual damage)"
+            )
+        return stitched
