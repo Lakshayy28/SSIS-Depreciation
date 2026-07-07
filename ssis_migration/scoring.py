@@ -216,6 +216,8 @@ class FunctionalScore:
     score: float
     equivalence: float
     version_ok: bool
+    judged: bool = True          # False → the LLM judge never ran; the score is
+                                 # NOT evidence of equivalence and cannot PASS
     critical_issues: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     version_issues: list[str] = field(default_factory=list)
@@ -229,6 +231,7 @@ class MigrationScorecard:
     composite: float
     passed: bool
     threshold: float
+    human_review_items: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -236,6 +239,7 @@ class MigrationScorecard:
             "composite": self.composite,
             "passed": self.passed,
             "threshold": self.threshold,
+            "human_review_items": self.human_review_items,
             "parsing": asdict(self.parsing),
             "functional": asdict(self.functional),
         }
@@ -244,10 +248,12 @@ class MigrationScorecard:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     def summary(self) -> str:
+        judged = "" if self.functional.judged else " NOT-JUDGED"
+        hr = f" human_review={self.human_review_items}" if self.human_review_items else ""
         return (
             f"composite={self.composite:.2f} "
             f"(parsing={self.parsing.score:.2f} × functional={self.functional.score:.2f}) "
-            f"version_ok={self.functional.version_ok} "
+            f"version_ok={self.functional.version_ok}{judged}{hr} "
             f"→ {'PASS' if self.passed else 'FAIL'}"
         )
 
@@ -287,12 +293,16 @@ def compute_functional_score(
     warnings: list[str],
     version_ok: bool,
     version_issues: list[str] | None = None,
+    judged: bool = True,
 ) -> FunctionalScore:
     """
     The functional score is the LLM equivalence judgment, hard-gated by version
     validity: code that uses APIs absent from the target PySpark version cannot
     be "functionally equivalent" on that runtime, so a version failure caps the
     score at 0.5 regardless of the equivalence judgment.
+
+    ``judged=False`` means the judge never ran (LLM unavailable) — the numbers
+    are placeholders and build_scorecard will refuse to PASS on them.
     """
     score = equivalence
     if not version_ok:
@@ -301,6 +311,7 @@ def compute_functional_score(
         score=round(min(1.0, max(0.0, score)), 4),
         equivalence=round(equivalence, 4),
         version_ok=version_ok,
+        judged=judged,
         critical_issues=critical_issues,
         warnings=warnings,
         version_issues=version_issues or [],
@@ -312,17 +323,23 @@ def build_scorecard(
     parsing: ParsingScore,
     functional: FunctionalScore,
     threshold: float = 0.75,
+    human_review_items: int = 0,
 ) -> MigrationScorecard:
     """
-    Composite = parsing × functional.  A migration only passes when the composite
-    clears the threshold AND there are no functional critical issues AND the
-    PySpark version is valid.
+    Composite = parsing × functional.  A migration only passes when ALL hold:
+      - composite clears the threshold
+      - no functional critical issues
+      - PySpark version is valid
+      - the equivalence judge actually RAN (a missing judgment is not a pass)
+      - nothing is waiting on human review
     """
     composite = round(parsing.score * functional.score, 4)
     passed = (
         composite >= threshold
         and not functional.critical_issues
         and functional.version_ok
+        and functional.judged
+        and human_review_items == 0
     )
     return MigrationScorecard(
         spark_version=spark_version,
@@ -331,4 +348,5 @@ def build_scorecard(
         composite=composite,
         passed=passed,
         threshold=threshold,
+        human_review_items=human_review_items,
     )

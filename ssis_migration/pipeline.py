@@ -379,24 +379,29 @@ class MigrationPipeline:
         det_version_ok, det_version_issues = scoring.check_pyspark_version(
             code, self._config.spark_version,
         )
+        judged = func_result is not None
         if func_result is not None:
             equivalence = func_result.equivalence_score
             critical = func_result.critical_issues
             warnings = func_result.warnings
             llm_version_issues = func_result.version_issues
         else:
-            equivalence, critical, warnings, llm_version_issues = 1.0, [], [], []
+            # Judge never ran — placeholders only; build_scorecard will not PASS.
+            equivalence, critical, llm_version_issues = 1.0, [], []
+            warnings = ["functional equivalence was NOT judged (LLM unavailable)"]
 
         version_issues = det_version_issues + list(llm_version_issues)
         version_ok = det_version_ok and not llm_version_issues
         functional = scoring.compute_functional_score(
             equivalence, critical, warnings, version_ok, version_issues,
+            judged=judged,
         )
 
         from ssis_migration.config import cfg
         card = scoring.build_scorecard(
             self._config.spark_version, parsing, functional,
             threshold=cfg.migration_pass_threshold,
+            human_review_items=len(cir.conversion_metadata.human_review_required),
         )
 
         self._config.output_dir.mkdir(parents=True, exist_ok=True)

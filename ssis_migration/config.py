@@ -54,6 +54,12 @@ class Config:
     copilot_reviewer_model: str = field(
         default_factory=lambda: os.environ.get("COPILOT_REVIEWER_MODEL", "claude-haiku-4.5")
     )
+    # Used automatically when the configured model returns model_not_supported
+    # (seat policies change server-side without notice — a batch run must not
+    # die because a model was withdrawn). gpt-4o is the most durably available.
+    copilot_fallback_model: str = field(
+        default_factory=lambda: os.environ.get("COPILOT_FALLBACK_MODEL", "gpt-4o")
+    )
     copilot_temperature: float = field(
         default_factory=lambda: float(os.environ.get("COPILOT_TEMPERATURE", "0.1"))
     )

@@ -409,8 +409,13 @@ Checks (be exhaustive):
 6. ERROR HANDLING — On-Failure precedence has equivalent try/except/fallback.
 7. NULL HANDLING — ISNULL/COALESCE preserved where the source handles nulls.
 8. DATA TYPES — SSIS type casts produce equivalent Spark types.
-9. PYSPARK {spark_version} VERSION — flag EVERY API not available in this exact
-   version into "version_issues" (these are also critical for equivalence).
+9. PYSPARK {spark_version} VERSION — flag APIs not available in this exact
+   version into "version_issues". Flag ONLY APIs you are CERTAIN postdate
+   {spark_version} (e.g. mapInPandas/applyInPandas/unpivot are 3.x+). Core
+   functions (avg, sum, count, min, max, coalesce, when, col, lit, broadcast)
+   and core DataFrame methods (join, groupBy, agg, withColumn, filter) exist in
+   every version since 1.6 — NEVER flag those. An uncertain guess is worse than
+   a miss: the deterministic version checker also runs.
 
 Score guide:
   1.0  — perfectly equivalent on the target version

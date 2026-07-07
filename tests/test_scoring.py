@@ -102,6 +102,23 @@ def test_version_failure_fails_scorecard():
     assert card.passed is False
 
 
+def test_unjudged_functional_cannot_pass():
+    # If the LLM judge never ran, placeholder scores must not produce a PASS.
+    ps = compute_parsing_score(1.0, {}, [], llm_fidelity=None)
+    fs = compute_functional_score(1.0, [], [], version_ok=True, judged=False)
+    card = build_scorecard("3.3", ps, fs, threshold=0.5)
+    assert card.passed is False
+    assert "NOT-JUDGED" in card.summary()
+
+
+def test_pending_human_review_fails_scorecard():
+    ps = compute_parsing_score(1.0, {}, [], llm_fidelity=None)
+    fs = compute_functional_score(1.0, [], [], version_ok=True)
+    card = build_scorecard("3.3", ps, fs, threshold=0.5, human_review_items=2)
+    assert card.passed is False
+    assert card.human_review_items == 2
+
+
 # ─── PySpark version validation ───────────────────────────────────────────────
 
 def test_parse_version():

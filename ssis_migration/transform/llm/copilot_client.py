@@ -49,6 +49,12 @@ _RATE_LIMITER: TokenBucket | None = None
 class CopilotUnavailableError(RuntimeError):
     """Raised when the Copilot endpoint is unreachable or the breaker is open."""
 
+
+# Models the endpoint has rejected with model_not_supported THIS process.
+# Seat policies change server-side; once a model 400s, every subsequent call
+# swaps to the fallback immediately instead of failing per-request.
+_UNSUPPORTED_MODELS: set[str] = set()
+
 # One JSON-L file per process inside the project so logs are easy to inspect.
 # The directory is git-ignored — logs are never committed.
 _LOG_DIR = Path(__file__).resolve().parents[3] / "copilot_chat_completions"
@@ -167,6 +173,7 @@ class CopilotClient:
         # ── NFR knobs ──────────────────────────────────────────────────────────
         self._timeout = cfg.copilot_request_timeout
         self._max_retries = max(1, cfg.copilot_max_retries)
+        self._fallback_model = cfg.copilot_fallback_model
         self._breaker = CircuitBreaker.get(
             _BREAKER_NAME,
             failure_threshold=cfg.circuit_breaker_threshold,
@@ -207,6 +214,13 @@ class CopilotClient:
             default_temperature=self._temperature,
             default_max_tokens=self._max_tokens,
         )
+
+        # Model fallback: if this model already returned model_not_supported in
+        # this process, don't burn another request on it.
+        if payload["model"] in _UNSUPPORTED_MODELS and payload["model"] != self._fallback_model:
+            logger.debug("Model '%s' known-unsupported — using fallback '%s'",
+                         payload["model"], self._fallback_model)
+            payload["model"] = self._fallback_model
 
         _write_log({
             "event": "request",
@@ -276,6 +290,21 @@ class CopilotClient:
                     raise CopilotUnavailableError(
                         f"Copilot API server error {resp.status_code} after {attempt} attempts"
                     )
+
+                # model_not_supported: the seat no longer serves this model.
+                # Swap to the fallback and retry the SAME attempt — losing a
+                # whole batch run to a server-side policy change is not OK.
+                if resp.status_code == 400 and "model_not_supported" in resp.text:
+                    bad = payload["model"]
+                    if bad != self._fallback_model:
+                        _UNSUPPORTED_MODELS.add(bad)
+                        logger.warning(
+                            "Model '%s' not supported on this seat — falling back to '%s' "
+                            "(update COPILOT_MODEL in .env; see GET /models)",
+                            bad, self._fallback_model,
+                        )
+                        payload["model"] = self._fallback_model
+                        continue
 
                 # 4xx other than 429 are caller/config errors — not retryable and
                 # NOT a breaker failure (a bad model id shouldn't trip the breaker).
