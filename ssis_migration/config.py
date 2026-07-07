@@ -69,6 +69,12 @@ class Config:
         default_factory=lambda: int(os.environ.get("FUNCTIONAL_VALIDATION_MAX_ITERATIONS", "2"))
     )
 
+    # Max LLM syntax-edit attempts per artifact (chunk / item / whole file).
+    # Deterministic repair (fences, whitespace, unicode) always runs first.
+    syntax_fix_max_iterations: int = field(
+        default_factory=lambda: int(os.environ.get("SYNTAX_FIX_MAX_ITERATIONS", "2"))
+    )
+
     # ── Resilience / NFRs (Copilot API) ───────────────────────────────────────
     # Per-request timeout in seconds.
     copilot_request_timeout: float = field(

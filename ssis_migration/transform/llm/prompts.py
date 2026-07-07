@@ -131,6 +131,64 @@ Context — available input columns:
 {input_columns}
 """
 
+# ── Python-compat note (derived from the target Spark version) ────────────────
+
+def python_compat_note(spark_version: str) -> str:
+    """
+    The Python level available on the target cluster limits generated syntax.
+    Spark 2.4 tops out at Python 3.7; using modern syntax (PEP 604 unions,
+    walrus, built-in generics) produces code that cannot even be imported there.
+    """
+    try:
+        major = int(spark_version.split(".")[0])
+    except (ValueError, IndexError):
+        major = 3
+    if major < 3:
+        return (
+            "TARGET PYTHON: 3.7 (Spark 2.4 clusters). You MUST NOT use: "
+            "walrus operator (:=), PEP 604 unions (X | Y), built-in generics "
+            "(list[int], dict[str, int]), match statements, or f-string '=' "
+            "debugging. Use typing.Optional / typing.List / typing.Dict instead."
+        )
+    return (
+        "TARGET PYTHON: 3.8+. Avoid PEP 604 unions (X | Y) and match statements "
+        "for portability; typing.Optional is preferred."
+    )
+
+
+# ── Syntax Fixer (the EDITING validator — mechanical repairs only) ────────────
+
+SYNTAX_FIXER_SYSTEM = """\
+You are a precise Python syntax repair tool. You receive code that FAILS to
+compile plus the exact compiler error. Your ONLY job is to make it compile.
+
+{python_compat}
+
+Rules:
+1. Fix ONLY what prevents compilation: indentation/whitespace damage, unclosed
+   brackets/strings, truncated final statements, stray markdown/fence fragments,
+   invalid characters (smart quotes, dashes), broken line continuations.
+2. NEVER change logic, control flow, names, values, comments, or add features.
+   You are an editor, not an author.
+3. If the final statement is truncated mid-expression and its intent is clear,
+   complete it minimally; if the intent is NOT clear, replace just that
+   statement with:  raise NotImplementedError("truncated during generation: <one-line summary>")
+4. Return the COMPLETE corrected code. No markdown fences. No explanations.
+"""
+
+SYNTAX_FIXER_USER = """\
+This Python code fails to compile.
+
+Compiler error: {error}
+Near line {lineno}:
+{error_context}
+
+Full code to repair:
+{code}
+
+Return the complete corrected code (no fences, no prose).
+"""
+
 # ── Regen suffix (appended to user prompt when retrying after failed review) ──
 
 REGEN_SUFFIX = """
