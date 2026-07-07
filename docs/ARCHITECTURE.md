@@ -68,6 +68,20 @@ decision, so an AUTO run is fully auditable (`routing_report_<pkg>.json`).
 
 ---
 
+## The four artifact stages
+
+```
+ DTSX ──► CIR (canonical, 100%-coverage audited) ──► ASSEMBLY MANIFEST (hybrid,
+ chunk-by-chunk provenance) ──► .py module (compile-gated, human-review banners)
+```
+
+Generation itself is **chunked** (SQL batches / .NET methods) with a shared
+**agent memory** carrying defined symbols and reviewer pitfalls between chunks,
+and every artifact passes an **editing syntax validator** at three altitudes
+(chunk → item → whole file). See [GENERATION.md](GENERATION.md) for the full
+design — chunking boundaries, lexical retrieval, and the two-validator split
+(the semantic reviewer never edits; the syntax validator only edits).
+
 ## Phase 3 — the conversion + equivalence-review loop
 
 This loop is what makes the output *functionally equivalent* rather than merely

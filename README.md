@@ -7,6 +7,7 @@ quantitative **dual-axis scorecard** gates every result — all centred on a
 Canonical Intermediate Representation (CIR).
 
 📖 **Deep dives:** [Architecture](docs/ARCHITECTURE.md) ·
+[Generation (chunking · memory · repair)](docs/GENERATION.md) ·
 [Scoring](docs/SCORING.md) · [Resilience / NFRs](docs/RESILIENCE.md)
 
 ## Architecture overview
