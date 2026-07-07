@@ -13,6 +13,7 @@ You are an expert ETL engineer migrating Microsoft SSIS Script Tasks to PySpark 
 Convert C# or VB.NET Script Task code into an equivalent Python function.
 
 Target runtime: PySpark {spark_version}  ← use ONLY APIs available in this version.
+{python_compat}
 
 Output contract:
 1. Output ONLY the Python function body — no explanation, no markdown fences.
@@ -47,6 +48,7 @@ COMPLEX_SQL_SYSTEM = """\
 You are an expert SQL engineer migrating T-SQL to Apache Spark {spark_version} / PySpark.
 
 Target runtime: PySpark {spark_version}  ← use ONLY APIs available in this version.
+{python_compat}
 
 Output contract:
 - Output ONLY a self-contained Python snippet. No explanation, no markdown fences.
@@ -187,6 +189,27 @@ Full code to repair:
 {code}
 
 Return the complete corrected code (no fences, no prose).
+"""
+
+# ── Chunked generation blocks ─────────────────────────────────────────────────
+
+CHUNK_NOTE = """
+
+━━━ CHUNKED CONVERSION — THIS IS CHUNK {index}/{total} ━━━━━━━━━━━━━━━━━━━━━━━
+You are converting one semantic unit ({kind}: {title}) of a larger source.
+Your output will be CONCATENATED after the previous chunks' output.
+- Convert ONLY the source shown above. Do not convert other chunks.
+- Reuse symbols from agent memory exactly; do NOT redefine or re-import them.
+- Do not emit wrapper boilerplate (no def main, no SparkSession creation) —
+  produce only the statements/functions for this unit.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+MEMORY_BLOCK = """
+
+━━━ AGENT MEMORY (shared context from this package's conversion so far) ━━━━━━
+{memory}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 # ── Regen suffix (appended to user prompt when retrying after failed review) ──

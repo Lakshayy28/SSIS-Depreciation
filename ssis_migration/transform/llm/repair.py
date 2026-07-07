@@ -56,9 +56,13 @@ _FENCE_RE = re.compile(
 
 # Prose lines models prepend despite instructions
 _PROSE_LINE_RE = re.compile(
-    r"^(here'?s?|sure|certainly|below is|the following|this (code|snippet)|"
-    r"i('| a)ve|note:|okay|ok\b).{0,200}$",
+    r"^(here'?s?\b|sure[,!]|certainly|below is|the following|this (code|snippet)|"
+    r"i('| ha)ve\b|note:).{0,200}$",
     re.IGNORECASE,
+)
+
+_CODE_LINE_RE = re.compile(
+    r"[=(\[{]|^\s*(def|class|import|from|return|if|for|while|with|try|raise|@|#)\b"
 )
 
 
@@ -81,14 +85,14 @@ def extract_code(text: str) -> str:
     # No complete fence — drop a dangling opening/closing fence line if present.
     lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```")]
 
-    # Strip leading prose (only obviously conversational lines).
+    # Strip leading prose — but NEVER a line that looks like code.
     start = 0
     for i, ln in enumerate(lines):
         stripped = ln.strip()
         if not stripped:
             start = i + 1
             continue
-        if _PROSE_LINE_RE.match(stripped) and not stripped.startswith(("#", "import", "from")):
+        if _PROSE_LINE_RE.match(stripped) and not _CODE_LINE_RE.search(stripped):
             start = i + 1
             continue
         break

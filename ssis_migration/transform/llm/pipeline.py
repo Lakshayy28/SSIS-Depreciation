@@ -52,22 +52,34 @@ class LLMPipeline:
         reviewer_model: str | None = None,
     ) -> None:
         from ssis_migration.config import cfg
+        from ssis_migration.transform.llm.assembly import AssemblyManifest
+        from ssis_migration.transform.llm.chunking import AgentMemory
+        from ssis_migration.transform.llm.repair import SyntaxFixer
 
         self._spark_version = spark_version
         self._client = CopilotClient(token=github_token)
         _reviewer_model = reviewer_model or cfg.copilot_reviewer_model
         _max_iter = cfg.copilot_max_review_iterations
 
+        # Shared per-package state: one memory + one hybrid-stage manifest.
+        # The pipeline instance is reused across functional-validation passes,
+        # so memory (symbols, pitfalls) accumulates over the whole conversion.
+        self.memory = AgentMemory(facts={"spark_version": spark_version})
+        self.manifest = AssemblyManifest(package="", spark_version=spark_version)
+        self._fixer = SyntaxFixer(self._client, spark_version=spark_version)
+
         reviewer = ReviewAgent(self._client, reviewer_model=_reviewer_model)
         self._script_agent = ScriptTaskAgent(
             self._client, reviewer,
             max_iterations=_max_iter,
             spark_version=spark_version,
+            fixer=self._fixer, memory=self.memory, manifest=self.manifest,
         )
         self._sql_agent = ComplexSQLAgent(
             self._client, reviewer,
             max_iterations=_max_iter,
             spark_version=spark_version,
+            fixer=self._fixer, memory=self.memory, manifest=self.manifest,
         )
         self._expr_agent = ExpressionAgent(self._client, spark_version=spark_version)
         # Judges use the (stronger) reviewer model, like the component reviewer.
@@ -86,6 +98,9 @@ class LLMPipeline:
         )
         if functional_context:
             logger.info("Carrying %d functional-validation issues from previous pass", len(functional_context))
+            self.memory.record_issues(functional_context)
+
+        self._seed_memory(cir)
 
         for exe in cir.control_flow.execution_tree:
             self._process_executable(exe, cir, functional_context)
@@ -121,6 +136,39 @@ class LLMPipeline:
 
     # ── private ───────────────────────────────────────────────────────────────
 
+    def _seed_memory(self, cir: CIR) -> None:
+        """Load package-level facts into agent memory (idempotent)."""
+        from pathlib import Path as _Path
+        self.manifest.package = _Path(cir.metadata.source_file).stem
+        if cir.parameters:
+            self.memory.add_fact(
+                "package_params", ", ".join(p.name for p in cir.parameters)
+            )
+        if cir.variables:
+            self.memory.add_fact(
+                "package_vars", ", ".join(v.name for v in cir.variables)
+            )
+        for conn in cir.connections:
+            desc = conn.provider_type
+            host = conn.resolved_parameters.get("host")
+            db = conn.resolved_parameters.get("database")
+            if host or db:
+                desc += f" host={host or '?'} db={db or '?'}"
+            self.memory.add_fact(f"connection[{conn.name}]", desc)
+
+    def _resolve_connection(self, cir: CIR, connection_ref: str | None):
+        """Match an executable/component connection ref to a CIRConnection."""
+        if not connection_ref:
+            return None
+        ref = connection_ref.lower()
+        for conn in cir.connections:
+            if conn.id.lower() == ref or conn.name.lower() == ref:
+                return conn
+        for conn in cir.connections:      # refIds look like Package.ConnectionManagers[Name]
+            if conn.name.lower() in ref:
+                return conn
+        return None
+
     def _process_executable(self, exe, cir: CIR, functional_context) -> None:
         if exe.conversion_status != ConversionStatus.LLM_REQUIRED:
             for child in exe.children:
@@ -130,6 +178,20 @@ class LLMPipeline:
         _STRUCTURAL = ("sequence", "for_loop", "foreach_loop", "data_flow")
         _OPERATIONAL = ("file_system", "ftp", "send_mail", "execute_process", "execute_sql")
 
+        try:
+            self._convert_executable(exe, cir, functional_context, _STRUCTURAL, _OPERATIONAL)
+        except Exception as exc:
+            # One broken item must never kill the whole package's LLM pass.
+            logger.warning("Conversion of %s failed (%s) — escalating to human review", exe.id, exc)
+            exe.conversion_status = ConversionStatus.HUMAN_REVIEW
+            exe.conversion_notes = f"conversion error: {exc}"
+            cir.flag_for_human_review(exe.id)
+
+        for child in exe.children:
+            self._process_executable(child, cir, functional_context)
+
+    def _convert_executable(self, exe, cir: CIR, functional_context,
+                            _STRUCTURAL, _OPERATIONAL) -> None:
         if exe.type in _STRUCTURAL:
             exe.conversion_status = ConversionStatus.DETERMINISTIC
 
@@ -139,6 +201,7 @@ class LLMPipeline:
                 language=exe.script_language or "csharp",
                 referenced_assemblies=exe.referenced_assemblies,
                 functional_context=functional_context,
+                item_id=exe.id,
             )
             confidence = compute_confidence(
                 result.code or "",
@@ -152,14 +215,24 @@ class LLMPipeline:
             else:
                 exe.conversion_status = ConversionStatus.HUMAN_REVIEW
                 exe.pyspark_snippet = result.code
+                exe.conversion_notes = result.notes or f"confidence={confidence:.2f}"
                 cir.flag_for_human_review(exe.id)
                 logger.warning("Script task %s escalated to human review (confidence=%.2f)", exe.id, confidence)
 
         elif exe.sql and exe.sql.transpilation_status == TranspilationStatus.LLM_REQUIRED:
+            conn = self._resolve_connection(cir, exe.connection_ref)
+            conn_kwargs = {}
+            if conn is not None:
+                conn_kwargs["connection_name"] = conn.name
+                conn_kwargs["connection_type"] = conn.provider_type
+                if conn.target_mapping and conn.target_mapping.url_template:
+                    conn_kwargs["jdbc_url_template"] = conn.target_mapping.url_template
             result = self._sql_agent.convert(
                 sql=exe.sql.original_text,
                 partial_transpilation=exe.sql.transpiled_text or "",
                 functional_context=functional_context,
+                item_id=exe.id,
+                **conn_kwargs,
             )
             if result.success:
                 exe.sql.transpiled_text = result.code
@@ -168,6 +241,9 @@ class LLMPipeline:
                 exe.conversion_status = ConversionStatus.LLM_COMPLETE
             else:
                 exe.conversion_status = ConversionStatus.HUMAN_REVIEW
+                exe.conversion_notes = result.notes or "SQL conversion failed review"
+                if result.code:
+                    exe.pyspark_snippet = result.code
                 cir.flag_for_human_review(exe.id)
 
         elif exe.type in _OPERATIONAL:
@@ -178,16 +254,23 @@ class LLMPipeline:
             cir.flag_for_human_review(exe.id)
             logger.warning("No LLM handler for executable %s (type=%s)", exe.id, exe.type)
 
-        for child in exe.children:
-            self._process_executable(child, cir, functional_context)
-
     def _process_component(self, comp, cir: CIR, functional_context) -> None:
+        try:
+            self._convert_component(comp, cir, functional_context)
+        except Exception as exc:
+            logger.warning("Conversion of component %s failed (%s) — human review", comp.id, exc)
+            comp.conversion_status = ConversionStatus.HUMAN_REVIEW
+            comp.conversion_notes = f"conversion error: {exc}"
+            cir.flag_for_human_review(comp.id)
+
+    def _convert_component(self, comp, cir: CIR, functional_context) -> None:
         if comp.subtype in ("script_component",) and comp.script_code:
             result = self._script_agent.convert(
                 code=comp.script_code,
                 language=comp.script_language or "csharp",
                 referenced_assemblies=comp.referenced_assemblies,
                 functional_context=functional_context,
+                item_id=comp.id,
             )
             confidence = compute_confidence(
                 result.code or "", result.review_passed,
@@ -298,11 +381,34 @@ def _build_cir_summary(cir: CIR) -> str:
     if cir.data_flows:
         lines.append("\nData flows:")
         for df in cir.data_flows:
-            lines.append(f"  DataFlow id={df.id}")
+            lines.append(f"  DataFlow id={df.id} name={df.name!r}")
             for comp in df.components:
-                lines.append(
-                    f"    [{comp.id}] subtype={comp.subtype} name={comp.name!r}"
-                    + (f"\n      pyspark_snippet={comp.pyspark_snippet[:200]!r}" if comp.pyspark_snippet else "")
-                )
+                detail = [f"    [{comp.id}] {comp.subtype} ({comp.type}) name={comp.name!r}"]
+                if comp.sql_command:
+                    detail.append(f"      sql: {' '.join(comp.sql_command.original_text.split())[:160]}")
+                for expr in comp.expressions:
+                    detail.append(
+                        f"      expr {expr.output_column} = {expr.ssis_expression[:100]}"
+                        + (f"  → {expr.pyspark_expression[:80]}" if expr.pyspark_expression else "")
+                    )
+                if comp.aggregations:
+                    aggs = ", ".join(f"{a.get('function')}({a.get('column')})" for a in comp.aggregations[:8])
+                    detail.append(f"      aggregations: {aggs}")
+                if comp.join_columns:
+                    joins = ", ".join(f"{j.input}={j.lookup}" for j in comp.join_columns)
+                    detail.append(f"      lookup join on: {joins}")
+                if comp.table_name:
+                    detail.append(f"      destination table: {comp.table_name}")
+                if comp.column_mappings:
+                    detail.append(f"      column mappings: {len(comp.column_mappings)}")
+                if comp.extra_properties.get("ParameterMapping"):
+                    detail.append(f"      parameter mapping: {comp.extra_properties['ParameterMapping']}")
+                if comp.pyspark_snippet:
+                    detail.append(f"      pyspark_snippet: {comp.pyspark_snippet[:160]!r}")
+                lines.extend(detail)
+            if df.paths:
+                flow = "; ".join(f"{p.from_id}→{p.to_id}" + (f" [{p.type}]" if p.type != "default" else "")
+                                 for p in df.paths)
+                lines.append(f"    paths: {flow}")
 
     return "\n".join(lines)

@@ -133,7 +133,14 @@ class ReviewAgent:
 # ── ScriptTaskAgent ───────────────────────────────────────────────────────────
 
 class ScriptTaskAgent:
-    """Converts C# or VB.NET Script Task code to a Python function."""
+    """
+    Converts C# or VB.NET Script Task code to a Python function.
+
+    Generation is chunked (method-boundary units) with agent memory injected,
+    each chunk and the assembled snippet pass the editing syntax validator, and
+    the assembled snippet goes through the review→regen loop. All attempts are
+    recorded in the AssemblyManifest (hybrid stage).
+    """
 
     def __init__(
         self,
@@ -141,11 +148,18 @@ class ScriptTaskAgent:
         review_agent: ReviewAgent,
         max_iterations: int = 4,
         spark_version: str = "3.3",
+        fixer=None,
+        memory=None,
+        manifest=None,
     ) -> None:
+        from ssis_migration.transform.llm.chunking import AgentMemory
         self._client = client
         self._reviewer = review_agent
         self._max_iterations = max_iterations
         self._spark_version = spark_version
+        self._fixer = fixer
+        self._memory = memory if memory is not None else AgentMemory()
+        self._manifest = manifest
 
     def convert(
         self,
@@ -155,52 +169,94 @@ class ScriptTaskAgent:
         read_vars: list[str] | None = None,
         write_vars: list[str] | None = None,
         functional_context: list[str] | None = None,
+        item_id: str = "script_task",
     ) -> AgentResult:
-        system = SCRIPT_TASK_SYSTEM.format(spark_version=self._spark_version)
-        base_user = SCRIPT_TASK_USER.format(
+        from ssis_migration.transform.llm.assembly import ItemAssembly
+        from ssis_migration.transform.llm.generation import ChunkedGenerator
+        from ssis_migration.transform.llm.prompts import python_compat_note
+
+        system = SCRIPT_TASK_SYSTEM.format(
             spark_version=self._spark_version,
-            language=language,
-            assemblies=", ".join(referenced_assemblies or []) or "none",
-            read_vars=", ".join(read_vars or []) or "none",
-            write_vars=", ".join(write_vars or []) or "none",
-            code=code,
+            python_compat=python_compat_note(self._spark_version),
         )
+        suffix = ""
         if functional_context:
-            base_user += FUNCTIONAL_CONTEXT_SUFFIX.format(
+            suffix += FUNCTIONAL_CONTEXT_SUFFIX.format(
                 issues="\n".join(f"- {i}" for i in functional_context)
             )
 
-        user_msg = base_user
-        for iteration in range(1, self._max_iterations + 1):
-            generated = _strip_markdown_fences(
-                self._client.simple_complete(system, user_msg)
-            )
+        generator = ChunkedGenerator(self._client, self._fixer, self._memory)
+        item = (
+            self._manifest.item(item_id, "script_task")
+            if self._manifest is not None
+            else ItemAssembly(item_id=item_id, item_kind="script_task")
+        )
 
-            passed, issues = self._reviewer.review(
-                generated,
-                component_type="script_task",
-                input_columns=read_vars or [],
-                output_columns=write_vars or [],
-                source_context=f"[{language}]\n{code}",
-                spark_version=self._spark_version,
-            )
-            if passed:
-                return AgentResult(
-                    success=True, code=generated,
-                    confidence=_base_confidence(iteration),
-                    review_passed=True, iterations=iteration,
+        generated = ""
+        for iteration in range(1, self._max_iterations + 1):
+            item.iterations = iteration
+            regen_suffix = suffix
+
+            def make_user(chunk_source: str, context: str, _suffix=regen_suffix) -> str:
+                return SCRIPT_TASK_USER.format(
+                    spark_version=self._spark_version,
+                    language=language,
+                    assemblies=", ".join(referenced_assemblies or []) or "none",
+                    read_vars=", ".join(read_vars or []) or "none",
+                    write_vars=", ".join(write_vars or []) or "none",
+                    code=chunk_source,
+                ) + _suffix + context
+
+            try:
+                generated, syntax_ok = generator.generate_item(
+                    item, code, language, system, make_user, self._manifest,
                 )
+            except Exception as exc:
+                logger.warning("ScriptTaskAgent generation failed for %s: %s", item_id, exc)
+                item.status = "failed"
+                item.notes = str(exc)
+                return AgentResult(success=False, code=None, confidence=0.0,
+                                   notes=f"generation error: {exc}")
+
+            if not syntax_ok:
+                # Code that doesn't compile is never sent to the semantic
+                # reviewer — regenerate with the compile error as the issue.
+                issues = [f"generated code does not compile: {item.notes}"]
+            else:
+                passed, issues = self._reviewer.review(
+                    generated,
+                    component_type="script_task",
+                    input_columns=read_vars or [],
+                    output_columns=write_vars or [],
+                    source_context=f"[{language}]\n{code}",
+                    spark_version=self._spark_version,
+                )
+                item.review_passed = passed
+                item.review_issues = issues
+                if passed:
+                    item.status = "complete"
+                    return AgentResult(
+                        success=True, code=generated,
+                        confidence=_base_confidence(iteration),
+                        review_passed=True, iterations=iteration,
+                    )
 
             logger.debug(
-                "ScriptTaskAgent iteration %d/%d failed review: %s",
+                "ScriptTaskAgent iteration %d/%d failed: %s",
                 iteration, self._max_iterations, issues,
             )
             if iteration < self._max_iterations:
-                # Feed issues back to generator — regenerate, do not patch
-                user_msg = base_user + REGEN_SUFFIX.format(
+                # Feed issues back to the generator (never patch) — via the
+                # regen suffix AND agent memory, so chunked regenerations see
+                # them on every chunk.
+                self._memory.record_issues(issues)
+                suffix = (functional_context and FUNCTIONAL_CONTEXT_SUFFIX.format(
+                    issues="\n".join(f"- {i}" for i in functional_context)) or "")
+                suffix += REGEN_SUFFIX.format(
                     issues="\n".join(f"- {i}" for i in issues)
                 )
 
+        item.status = "human_review"
         return AgentResult(
             success=False, code=generated, confidence=0.3,
             notes=f"Review-regen loop exhausted after {self._max_iterations} iterations",
@@ -211,7 +267,14 @@ class ScriptTaskAgent:
 # ── ComplexSQLAgent ───────────────────────────────────────────────────────────
 
 class ComplexSQLAgent:
-    """Converts procedural T-SQL to Spark SQL / PySpark DataFrame operations."""
+    """
+    Converts procedural T-SQL to Spark SQL / PySpark DataFrame operations.
+
+    Large scripts are chunked at GO-batch / statement boundaries with agent
+    memory carrying declared variables and temp-view names across chunks; every
+    chunk and the assembled snippet must compile (editing syntax validator)
+    before the semantic reviewer judges the whole.
+    """
 
     def __init__(
         self,
@@ -219,11 +282,18 @@ class ComplexSQLAgent:
         review_agent: ReviewAgent,
         max_iterations: int = 4,
         spark_version: str = "3.3",
+        fixer=None,
+        memory=None,
+        manifest=None,
     ) -> None:
+        from ssis_migration.transform.llm.chunking import AgentMemory
         self._client = client
         self._reviewer = review_agent
         self._max_iterations = max_iterations
         self._spark_version = spark_version
+        self._fixer = fixer
+        self._memory = memory if memory is not None else AgentMemory()
+        self._manifest = manifest
 
     def convert(
         self,
@@ -233,55 +303,90 @@ class ComplexSQLAgent:
         jdbc_url_template: str = "jdbc:sqlserver://{host}:{port};databaseName={database}",
         connection_name: str = "sqlserver_conn",
         functional_context: list[str] | None = None,
+        item_id: str = "complex_sql",
     ) -> AgentResult:
+        from ssis_migration.transform.llm.assembly import ItemAssembly
+        from ssis_migration.transform.llm.generation import ChunkedGenerator
+        from ssis_migration.transform.llm.prompts import python_compat_note
+
         system = COMPLEX_SQL_SYSTEM.format(
             spark_version=self._spark_version,
             connection_name=connection_name,
+            python_compat=python_compat_note(self._spark_version),
         )
-        base_user = COMPLEX_SQL_USER.format(
-            spark_version=self._spark_version,
-            sql=sql,
-            partial_transpilation=partial_transpilation or "none",
-            connection_type=connection_type,
-            jdbc_url_template=jdbc_url_template,
-            connection_name=connection_name,
-        )
+        suffix = ""
         if functional_context:
-            base_user += FUNCTIONAL_CONTEXT_SUFFIX.format(
+            suffix += FUNCTIONAL_CONTEXT_SUFFIX.format(
                 issues="\n".join(f"- {i}" for i in functional_context)
             )
 
-        user_msg = base_user
+        generator = ChunkedGenerator(self._client, self._fixer, self._memory)
+        item = (
+            self._manifest.item(item_id, "complex_sql")
+            if self._manifest is not None
+            else ItemAssembly(item_id=item_id, item_kind="complex_sql")
+        )
+
         generated = ""
         for iteration in range(1, self._max_iterations + 1):
-            generated = _strip_markdown_fences(
-                self._client.simple_complete(system, user_msg)
-            )
+            item.iterations = iteration
+            regen_suffix = suffix
 
-            passed, issues = self._reviewer.review(
-                generated,
-                component_type="complex_sql",
-                input_columns=[],
-                output_columns=[],
-                source_context=f"[T-SQL]\n{sql}",
-                spark_version=self._spark_version,
-            )
-            if passed:
-                return AgentResult(
-                    success=True, code=generated,
-                    confidence=_base_confidence(iteration),
-                    review_passed=True, iterations=iteration,
+            def make_user(chunk_source: str, context: str, _suffix=regen_suffix) -> str:
+                return COMPLEX_SQL_USER.format(
+                    spark_version=self._spark_version,
+                    sql=chunk_source,
+                    partial_transpilation=partial_transpilation or "none",
+                    connection_type=connection_type,
+                    jdbc_url_template=jdbc_url_template,
+                    connection_name=connection_name,
+                ) + _suffix + context
+
+            try:
+                generated, syntax_ok = generator.generate_item(
+                    item, sql, "tsql", system, make_user, self._manifest,
                 )
+            except Exception as exc:
+                logger.warning("ComplexSQLAgent generation failed for %s: %s", item_id, exc)
+                item.status = "failed"
+                item.notes = str(exc)
+                return AgentResult(success=False, code=None, confidence=0.0,
+                                   notes=f"generation error: {exc}")
+
+            if not syntax_ok:
+                issues = [f"generated code does not compile: {item.notes}"]
+            else:
+                passed, issues = self._reviewer.review(
+                    generated,
+                    component_type="complex_sql",
+                    input_columns=[],
+                    output_columns=[],
+                    source_context=f"[T-SQL]\n{sql}",
+                    spark_version=self._spark_version,
+                )
+                item.review_passed = passed
+                item.review_issues = issues
+                if passed:
+                    item.status = "complete"
+                    return AgentResult(
+                        success=True, code=generated,
+                        confidence=_base_confidence(iteration),
+                        review_passed=True, iterations=iteration,
+                    )
 
             logger.debug(
-                "ComplexSQLAgent iteration %d/%d failed review: %s",
+                "ComplexSQLAgent iteration %d/%d failed: %s",
                 iteration, self._max_iterations, issues,
             )
             if iteration < self._max_iterations:
-                user_msg = base_user + REGEN_SUFFIX.format(
+                self._memory.record_issues(issues)
+                suffix = (functional_context and FUNCTIONAL_CONTEXT_SUFFIX.format(
+                    issues="\n".join(f"- {i}" for i in functional_context)) or "")
+                suffix += REGEN_SUFFIX.format(
                     issues="\n".join(f"- {i}" for i in issues)
                 )
 
+        item.status = "human_review"
         return AgentResult(
             success=False, code=generated, confidence=0.3,
             notes=f"Review-regen loop exhausted after {self._max_iterations} iterations",

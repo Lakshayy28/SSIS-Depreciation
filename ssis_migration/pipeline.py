@@ -154,6 +154,8 @@ class MigrationPipeline:
         from ssis_migration.config import cfg as _cfg
 
         func_result = None      # last FunctionalValidationResult, for the scorecard
+        llm_pipeline = None     # ONE instance per package: agent memory and the
+                                # hybrid manifest accumulate across outer passes
 
         if mode == ConversionMode.DETERMINISTIC:
             logger.info("[3/5] LLM skipped (mode=deterministic)")
@@ -162,6 +164,15 @@ class MigrationPipeline:
                 return result
 
         else:
+            if self._config.github_token:
+                try:
+                    from ssis_migration.transform.llm import LLMPipeline
+                    llm_pipeline = LLMPipeline(
+                        github_token=self._config.github_token,
+                        spark_version=self._config.spark_version,
+                    )
+                except Exception as exc:
+                    logger.warning("LLM pipeline unavailable (%s) — deterministic output only", exc)
             # HYBRID / LLM / AUTO: review→regen→re-validate loop. Each pass:
             #   convert LLM items → generate code → review equivalence vs DTSX →
             #   if it fails, feed the critical issues back and re-convert.
@@ -178,22 +189,23 @@ class MigrationPipeline:
                     self._flag_all_for_llm(cir)
 
                 has_llm_items = bool(cir.conversion_metadata.llm_required_items)
-                if has_llm_items:
-                    self._run_llm(cir, dtsx_path, functional_feedback=functional_feedback)
+                if has_llm_items and llm_pipeline is not None:
+                    self._run_llm(llm_pipeline, cir, dtsx_path, functional_feedback=functional_feedback)
                 else:
-                    logger.info("[3/5] LLM skipped (0 LLM_REQUIRED items)")
+                    logger.info("[3/5] LLM skipped (%s)",
+                                "0 LLM_REQUIRED items" if not has_llm_items else "no LLM pipeline")
 
                 # Phase 4: generate code
                 paths = self._codegen(cir, result, dtsx_path)
                 if paths is None:
                     return result
 
-                if not can_validate:
+                if not can_validate or llm_pipeline is None:
                     break
 
                 # Equivalence review of the freshly generated artifact.
                 func_result = self._run_functional_validation(
-                    result.module_path, cir, dtsx_path, dtsx_xml,
+                    llm_pipeline, result.module_path, cir, dtsx_path, dtsx_xml,
                 )
 
                 regen_possible = has_llm_items and func_iter < max_func_iters
@@ -237,7 +249,7 @@ class MigrationPipeline:
         if mode != ConversionMode.DETERMINISTIC and result.module_path is not None:
             try:
                 result.scorecard = self._build_scorecard(
-                    cir, dtsx_path, dtsx_xml, result.module_path, func_result,
+                    llm_pipeline, cir, dtsx_path, dtsx_xml, result.module_path, func_result,
                 )
                 logger.info("[score] %s", result.scorecard.summary())
             except Exception as exc:
@@ -262,37 +274,37 @@ class MigrationPipeline:
 
     def _run_llm(
         self,
+        llm_pipeline,
         cir: CIR,
         dtsx_path: Path,
         functional_feedback: list[str] | None = None,
     ) -> None:
         try:
-            from ssis_migration.transform.llm import LLMPipeline
-            llm_pipeline = LLMPipeline(
-                github_token=self._config.github_token,
-                spark_version=self._config.spark_version,
-            )
             llm_pipeline.process(cir, functional_context=functional_feedback)
             logger.info(
                 "[3/5] LLM complete: human_review=%d",
                 len(cir.conversion_metadata.human_review_required),
             )
+            # Persist the hybrid stage (chunk-by-chunk assembly record).
+            try:
+                manifest_path = self._config.output_dir / f"hybrid_{dtsx_path.stem}.json"
+                self._config.output_dir.mkdir(parents=True, exist_ok=True)
+                llm_pipeline.manifest.save(manifest_path)
+                logger.info("[3/5] Hybrid assembly manifest: %s (%s)",
+                            manifest_path.name, llm_pipeline.manifest.summary())
+            except Exception as exc:
+                logger.debug("Manifest save skipped: %s", exc)
             if self._config.save_cir:
                 self._save_cir(cir, dtsx_path, stage="resolved")
         except Exception as exc:
             logger.warning("LLM pipeline failed (continuing without): %s", exc)
 
     def _run_functional_validation(
-        self, module_path: Path, cir: CIR, dtsx_path: Path, dtsx_xml: str = "",
+        self, llm_pipeline, module_path: Path, cir: CIR, dtsx_path: Path, dtsx_xml: str = "",
     ):
         """Run functional equivalence review. Returns FunctionalValidationResult or None."""
         try:
-            from ssis_migration.transform.llm import LLMPipeline
             pyspark_code = module_path.read_text(encoding="utf-8")
-            llm_pipeline = LLMPipeline(
-                github_token=self._config.github_token,
-                spark_version=self._config.spark_version,
-            )
             func_result = llm_pipeline.functional_validate(pyspark_code, cir, dtsx_xml=dtsx_xml)
             logger.info(
                 "Equivalence review: passed=%s score=%.2f critical=%d warnings=%d version=%d",
@@ -307,7 +319,7 @@ class MigrationPipeline:
             logger.warning("Functional validation failed (skipping): %s", exc)
             return None
 
-    def _build_scorecard(self, cir, dtsx_path, dtsx_xml, module_path, func_result):
+    def _build_scorecard(self, llm_pipeline, cir, dtsx_path, dtsx_xml, module_path, func_result):
         """Assemble the dual-axis (parsing × functional) scorecard for this package."""
         from ssis_migration import scoring
 
@@ -319,13 +331,9 @@ class MigrationPipeline:
 
         llm_fidelity = None
         parse_issues: list[str] = []
-        if self._config.github_token:
+        if llm_pipeline is not None:
             try:
-                from ssis_migration.transform.llm import LLMPipeline
-                pf = LLMPipeline(
-                    github_token=self._config.github_token,
-                    spark_version=self._config.spark_version,
-                ).parsing_fidelity(cir, dtsx_xml)
+                pf = llm_pipeline.parsing_fidelity(cir, dtsx_xml)
                 llm_fidelity = pf.fidelity_score
                 parse_issues = list(pf.missing_elements) + list(pf.misrepresentations)
             except Exception as exc:
