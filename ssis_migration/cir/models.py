@@ -257,6 +257,8 @@ class ControlFlowExecutable(BaseModel):
     script_language: str | None = None
     script_code: str | None = None
     referenced_assemblies: list[str] = Field(default_factory=list)
+    read_only_variables: list[str] = Field(default_factory=list)
+    read_write_variables: list[str] = Field(default_factory=list)
 
     # For Loop / Foreach Loop
     loop_variable: str | None = None
@@ -342,6 +344,12 @@ class CIRMetadata(BaseModel):
     # completeness is auditable without re-reading the source file:
     # {"coverage": 0.97, "detail": {category: {"dtsx": n, "cir": m, "coverage": r}}}
     parse_coverage: dict[str, Any] | None = None
+    # DTSX package format era ("2"/"3" = 2005/2008 property-element style,
+    # "6"/"8" = 2012+/2014+ attribute style) and protection level, so downstream
+    # stages know what dialect they came from and whether sensitive values
+    # were stripped by encryption.
+    package_format_version: str | None = None
+    protection_level: str | None = None
 
 
 class CIR(BaseModel):

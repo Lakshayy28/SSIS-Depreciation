@@ -202,6 +202,8 @@ class LLMPipeline:
                 code=exe.script_code,
                 language=exe.script_language or "csharp",
                 referenced_assemblies=exe.referenced_assemblies,
+                read_vars=exe.read_only_variables,
+                write_vars=exe.read_write_variables,
                 functional_context=functional_context,
                 item_id=exe.id,
             )
@@ -373,10 +375,27 @@ def _build_cir_summary(cir: CIR) -> str:
     ]
     for exe in cir.control_flow.execution_tree:
         sql_text = exe.sql.original_text[:120] if exe.sql else None
+        bindings = ""
+        if exe.parameter_mappings:
+            pairs = ", ".join(
+                f"{m.get('name', '?')}←{m.get('variable', '?')}"
+                if m.get("kind") != "result"
+                else f"{m.get('variable', '?')}←result[{m.get('name', '?')}]"
+                for m in exe.parameter_mappings[:6]
+            )
+            bindings = f"\n    bindings: {pairs}"
+        script_vars = ""
+        if exe.read_only_variables or exe.read_write_variables:
+            script_vars = (
+                f"\n    script vars: reads={exe.read_only_variables} "
+                f"writes={exe.read_write_variables}"
+            )
         lines.append(
             f"  [{exe.id}] type={exe.type} name={exe.name!r}"
             + (f" sql={sql_text!r}" if sql_text else "")
             + (f" status={exe.conversion_status.value}" if exe.conversion_status else "")
+            + bindings
+            + script_vars
             + (f"\n    pyspark_snippet={exe.pyspark_snippet[:200]!r}" if exe.pyspark_snippet else "")
         )
 

@@ -38,10 +38,12 @@ class ParameterExtractor:
         if container is None:
             return params
 
+        from ssis_migration.parser.ns import dts_attr
+
         for el in container.findall(DTS_PARAMETER):
-            name = el.get(ATTR_OBJECT_NAME) or el.get(ATTR_NAME, "")
+            name = dts_attr(el, "ObjectName")
             dtype_raw = el.get(ATTR_DATA_TYPE, "8")
-            sensitive = el.get(ATTR_SENSITIVE, "0") == "1"
+            sensitive = dts_attr(el, "Sensitive") in ("1", "-1", "True", "true")
 
             # Default value lives in a nested DTS:Property name="ParameterValue"
             default_val = None

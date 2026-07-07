@@ -141,19 +141,22 @@ class ConnectionExtractor:
         if managers_el is None:
             return results
 
-        for cm_el in managers_el.findall(DTS_CONNECTION_MANAGER):
-            name = cm_el.get(ATTR_OBJECT_NAME) or cm_el.get(ATTR_NAME, "")
-            creation_name = cm_el.get(ATTR_CREATION_NAME, "").upper()
+        from ssis_migration.parser.ns import dts_attr
 
-            # ConnectionString may be on the outer element OR in a nested
-            # DTS:ObjectData/DTS:ConnectionManager element (common in SSIS 2012+)
-            cs = cm_el.get(ATTR_CONNECTION_STRING, "")
+        for cm_el in managers_el.findall(DTS_CONNECTION_MANAGER):
+            name = dts_attr(cm_el, "ObjectName")
+            creation_name = dts_attr(cm_el, "CreationName").upper()
+
+            # ConnectionString may be on the outer element (attribute or
+            # DTS:Property child — 2005/2008) OR on a nested
+            # DTS:ObjectData/DTS:ConnectionManager element (SSIS 2012+).
+            cs = dts_attr(cm_el, "ConnectionString")
             if not cs:
                 obj_data = cm_el.find(f"{{{DTS}}}ObjectData")
                 if obj_data is not None:
                     inner = obj_data.find(DTS_CONNECTION_MANAGER)
                     if inner is not None:
-                        cs = inner.get(ATTR_CONNECTION_STRING, "")
+                        cs = dts_attr(inner, "ConnectionString")
 
             provider_type = "unknown"
             for prefix, canonical in _PROVIDER_MAP.items():

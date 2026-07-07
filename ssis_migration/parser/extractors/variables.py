@@ -34,36 +34,53 @@ def _resolve_dtype(raw: str) -> str:
 
 class VariableExtractor:
     """
-    Recursively extracts variables from the root package scope.
-    Container-scoped variables are captured by the ControlFlowExtractor
-    alongside their parent executable.
+    Extracts variables from EVERY scope in the package — the root and any
+    container (Sequence / For Loop / Foreach Loop) that declares its own
+    DTS:Variables collection. Loop iteration variables live at container
+    scope, so a root-only scan silently loses them.
     """
 
     def __init__(self, root: etree._Element) -> None:
         self._root = root
 
     def extract(self, scope: str = "package") -> list[CIRVariable]:
-        return self._extract_from(self._root, scope)
+        from ssis_migration.parser.ns import DTS_EXECUTABLE, dts_attr
+
+        results = self._extract_from(self._root, scope)
+        # Container-scoped variables: any nested executable with its own
+        # DTS:Variables collection.
+        for exe_el in self._root.iterfind(f".//{DTS_EXECUTABLE}"):
+            container_name = dts_attr(exe_el, "ObjectName") or "container"
+            results.extend(self._extract_from(exe_el, scope=container_name))
+        return results
 
     def _extract_from(self, node: etree._Element, scope: str) -> list[CIRVariable]:
+        from ssis_migration.parser.ns import dts_attr
+
         results: list[CIRVariable] = []
         vars_el = node.find(DTS_VARIABLES)
         if vars_el is None:
             return results
 
         for var_el in vars_el.findall(DTS_VARIABLE):
-            name = var_el.get(ATTR_OBJECT_NAME) or var_el.get(ATTR_NAME, "")
-            ns = var_el.get(ATTR_NAMESPACE, "User")
+            name = dts_attr(var_el, "ObjectName")
+            ns = dts_attr(var_el, "Namespace") or "User"
             dtype_raw = var_el.get(ATTR_DATA_TYPE, "8")
-            evaluate_as_expr = var_el.get(ATTR_EVALUATE_AS_EXPRESSION, "0") == "1"
+            evaluate_as_expr = dts_attr(var_el, "EvaluateAsExpression") in ("1", "-1", "True", "true")
 
-            # Value and Expression are child elements
+            # Value and Expression are child elements (both format eras)
             default_val = None
             expression = None
             for child in var_el:
+                if not isinstance(child.tag, str):
+                    continue
                 local = etree.QName(child.tag).localname
                 if local == "VariableValue":
                     default_val = child.text
+                    # 2005/2008 puts the data type on the value element
+                    dt = child.get(ATTR_DATA_TYPE) or child.get("DataType")
+                    if dt:
+                        dtype_raw = dt
                 elif local == "Expression":
                     expression = child.text
 

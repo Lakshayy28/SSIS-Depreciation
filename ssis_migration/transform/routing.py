@@ -196,6 +196,11 @@ class Router:
     def _decide_sql(self, item_id: str, kind: str, sql) -> RoutingDecision:
         text = (sql.original_text or "").strip()
         if not text:
+            if sql.transpilation_notes:
+                # Statement text is resolved at runtime (Variable / file
+                # connection source) — nothing static to convert.
+                return RoutingDecision(item_id, kind, RoutingTarget.HUMAN_REVIEW,
+                                       sql.transpilation_notes)
             return RoutingDecision(item_id, kind, RoutingTarget.DETERMINISTIC,
                                    "Empty SQL statement")
 

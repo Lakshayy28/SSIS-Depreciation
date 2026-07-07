@@ -43,6 +43,66 @@ from ssis_migration.cir.models import (
 from ssis_migration.cir.type_mapping import normalize_ssis_type, resolve_type
 from ssis_migration.parser.ns import map_component_class
 
+# componentClassID GUIDs CHANGE between SSIS versions, so no GUID table can be
+# exhaustive. The contactInfo attribute, however, carries the human display
+# name in every version ("Derived Column;Microsoft Corporation;…"), and the
+# component's own name usually echoes it — keyword matching on those rescues
+# classification for any version whose GUIDs we don't know.
+_DISPLAY_NAME_MAP: list[tuple[str, str]] = [
+    ("ole db source", "oledb_source"),
+    ("oledb source", "oledb_source"),
+    ("ado net source", "ado_net_source"),
+    ("ado.net source", "ado_net_source"),
+    ("flat file source", "flat_file_source"),
+    ("excel source", "excel_source"),
+    ("xml source", "xml_source"),
+    ("ole db destination", "oledb_destination"),
+    ("oledb destination", "oledb_destination"),
+    ("ado net destination", "ado_net_destination"),
+    ("ado.net destination", "ado_net_destination"),
+    ("flat file destination", "flat_file_destination"),
+    ("excel destination", "excel_destination"),
+    ("ole db command", "oledb_command"),
+    ("derived column", "derived_column"),
+    ("conditional split", "conditional_split"),
+    ("data conversion", "data_conversion"),
+    ("merge join", "merge_join"),
+    ("fuzzy lookup", "fuzzy_lookup"),
+    ("fuzzy grouping", "fuzzy_grouping"),
+    ("lookup", "lookup"),
+    ("union all", "union_all"),
+    ("multicast", "multicast"),
+    ("row count", "row_count"),
+    ("rowcount", "row_count"),
+    ("copy column", "copy_column"),
+    ("character map", "character_map"),
+    ("aggregate", "aggregate"),
+    ("sort", "sort"),
+    ("pivot", "pivot"),
+    ("unpivot", "unpivot"),
+    ("script component", "script_component"),
+    ("slowly changing dimension", "slowly_changing_dimension"),
+    ("term extraction", "term_extraction"),
+    ("merge", "merge_join"),
+]
+
+
+def _classify_component(class_id: str, contact_info: str, name: str) -> str:
+    """GUID/logical-name table first; display-name keyword fallback second."""
+    subtype = map_component_class(class_id)
+    if subtype != "unknown_component":
+        return subtype
+    # contactInfo's display name is authoritative; component name is a
+    # weaker echo but usually derived from it. Longest keyword wins
+    # ("fuzzy lookup" must beat "lookup").
+    for haystack in (contact_info.lower(), name.lower()):
+        if not haystack:
+            continue
+        for keyword, mapped in _DISPLAY_NAME_MAP:
+            if keyword in haystack:
+                return mapped
+    return "unknown_component"
+
 # Custom property names we care about
 _PROP_SQL_COMMAND = "SqlCommand"
 _PROP_SQL_COMMAND_VARIABLE = "SqlCommandVariable"
@@ -171,8 +231,8 @@ class DataFlowExtractor:
 
     def _parse_component(self, el: etree._Element) -> DataFlowComponent | None:
         class_id = el.get("componentClassID", "")
-        subtype = map_component_class(class_id)
         name = el.get("name", "")
+        subtype = _classify_component(class_id, el.get("contactInfo", ""), name)
         comp_id = self._comp_id(subtype)
 
         props = _get_props(el)

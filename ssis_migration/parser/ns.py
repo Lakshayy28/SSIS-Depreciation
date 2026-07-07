@@ -1,9 +1,11 @@
 """
-DTSX XML namespace constants.
+DTSX XML namespace constants and era-independent lookup helpers.
 
 All .dtsx files use these namespace URIs. We register them once here so
 every extractor uses consistent prefixes via lxml's XPath API.
 """
+
+import re
 
 NAMESPACES: dict[str, str] = {
     "DTS": "www.microsoft.com/SqlServer/Dts",
@@ -120,12 +122,100 @@ COMPONENT_CLASS_MAP: dict[str, str] = {
 }
 
 
+# Class-name tokens for era-independent executable-type matching. 2008–2014
+# packages write assembly-qualified .NET type names like
+#   "Microsoft.SqlServer.Dts.Tasks.ExecuteSQLTask.ExecuteSQLTask,
+#    Microsoft.SqlServer.SQLTask, Version=10.0.0.0, ..."
+# and stock names like "SSIS.Pipeline.3" / "SSIS.Package.3" — none of which
+# contain the modern logical names, so a token table is matched against the
+# dotted segments of the type portion (before the first comma).
+_TYPE_TOKEN_MAP: dict[str, str] = {
+    "executesqltask": "execute_sql",
+    "pipeline": "data_flow",
+    "scripttask": "script_task",
+    "forlooptask": "for_loop",
+    "forloop": "for_loop",
+    "foreachloopcontainer": "foreach_loop",
+    "foreachloop": "foreach_loop",
+    "sequence": "sequence",
+    "expressiontask": "expression_task",
+    "executepackagetask": "execute_package",
+    "filesystemtask": "file_system",
+    "ftptask": "ftp",
+    "sendmailtask": "send_mail",
+    "executeprocesstask": "execute_process",
+    "executeprocess": "execute_process",
+    "bulkinserttask": "bulk_insert",
+    "dataprofilingtask": "data_profiling",
+    "webservicetask": "web_service",
+    "xmltask": "xml_task",
+    "wmidatareadertask": "wmi_data_reader",
+    "wmieventwatchertask": "wmi_event_watcher",
+    "transferdatabasetask": "transfer_database",
+    "messagequeuetask": "message_queue",
+    "activexscripttask": "activex_script",
+    "package": "package",
+}
+
+
 def map_executable_type(raw_type: str) -> str:
-    """Map SSIS ExecutableType string to CIR type name."""
+    """
+    Map an SSIS ExecutableType/CreationName string to a CIR type name.
+
+    Handles all observed eras:
+      - modern logical names:      Microsoft.ExecuteSQLTask
+      - versioned stock names:     SSIS.Pipeline.3, SSIS.Package.3, STOCK:SEQUENCE
+      - assembly-qualified names:  Microsoft.SqlServer.Dts.Tasks.X.X, Assembly, Version=…
+    """
+    if not raw_type:
+        return ""
+    lowered = raw_type.lower()
+
+    # 1. Modern logical / STOCK names (substring match on the curated map)
     for key, value in EXECUTABLE_TYPE_MAP.items():
-        if key.lower() in raw_type.lower():
+        if key.lower() in lowered:
             return value
-    return raw_type.split(".")[-1].lower()
+
+    # 2. Token match on the .NET type portion (before any assembly qualifier),
+    #    with version suffixes stripped ("SSIS.Pipeline.3" → segment "pipeline").
+    type_portion = lowered.split(",", 1)[0]
+    segments = [
+        seg for seg in re.split(r"[.\s:]+", type_portion)
+        if seg and not seg.isdigit()
+    ]
+    # Longest-token-first so "executepackagetask" beats "package".
+    for token in sorted(_TYPE_TOKEN_MAP, key=len, reverse=True):
+        if token in segments:
+            return _TYPE_TOKEN_MAP[token]
+    # Suffix match rescues concatenated forms like "myexecutesqltask"
+    for token in sorted(_TYPE_TOKEN_MAP, key=len, reverse=True):
+        if any(seg.endswith(token) for seg in segments):
+            return _TYPE_TOKEN_MAP[token]
+
+    return segments[-1] if segments else lowered
+
+
+def dts_attr(el, name: str, default: str = "") -> str:
+    """
+    Read a DTS property regardless of package format era.
+
+    PackageFormatVersion 6+ (SQL 2012+) stores properties as namespaced
+    ATTRIBUTES (DTS:ObjectName="x"); versions 2/3 (2005/2008) store most of
+    them as CHILD ELEMENTS (<DTS:Property DTS:Name="ObjectName">x</DTS:Property>).
+    Some third-party writers also emit un-namespaced attributes. Check all three.
+    """
+    val = el.get(f"{{{DTS}}}{name}")
+    if val is not None:
+        return val
+    val = el.get(name)
+    if val is not None:
+        return val
+    for child in el:
+        if child.tag == DTS_PROPERTY and (
+            child.get(ATTR_NAME) == name or child.get("Name") == name
+        ):
+            return (child.text or "").strip()
+    return default
 
 
 # Logical component class names (modern DTSX writes these instead of GUIDs)

@@ -39,6 +39,7 @@ from ssis_migration.parser.ns import (
     EVAL_OP_FAILURE,
     EVAL_OP_SUCCESS,
     NAMESPACES,
+    dts_attr,
     map_executable_type,
 )
 
@@ -109,12 +110,13 @@ class ControlFlowExtractor:
         return results
 
     def _parse_executable(self, el: etree._Element) -> ControlFlowExecutable | None:
-        # SSIS packages use either DTS:ExecutableType or DTS:CreationName
-        raw_type = el.get(ATTR_EXECUTABLE_TYPE, "") or el.get(f"{{{DTS}}}CreationName", "")
+        # Type may live in DTS:ExecutableType or DTS:CreationName, as an
+        # attribute (2012+) or a DTS:Property child (2005/2008).
+        raw_type = dts_attr(el, "ExecutableType") or dts_attr(el, "CreationName")
 
         # Fall back to description for bare Sequence Containers
         if not raw_type:
-            desc = el.get(f"{{{DTS}}}Description", "")
+            desc = dts_attr(el, "Description")
             if "sequence" in desc.lower():
                 raw_type = "Microsoft.Sequence"
             elif el.find(DTS_EXECUTABLES) is not None:
@@ -122,7 +124,7 @@ class ControlFlowExtractor:
                 raw_type = "Microsoft.Sequence"
 
         cir_type = map_executable_type(raw_type) if raw_type else "sequence"
-        name = el.get(_ATTR_NAME, el.get(f"{{{DTS}}}ObjectName", ""))
+        name = dts_attr(el, "ObjectName")
         exec_id = _gen_id(cir_type[:4])
 
         exe = ControlFlowExecutable(id=exec_id, name=name, type=cir_type)
@@ -148,28 +150,132 @@ class ControlFlowExtractor:
             return
         sql_data = obj_data.find(_SQLTASK_DATA)
         if sql_data is None:
+            # Some writers omit the namespace on SqlTaskData — match by local name.
+            for child in obj_data.iter():
+                if isinstance(child.tag, str) and child.tag.rsplit("}", 1)[-1] == "SqlTaskData":
+                    sql_data = child
+                    break
+        if sql_data is None:
             return
 
-        sql_text = sql_data.get(_SQLTASK_SQL_SOURCE, "")
-        result_raw = sql_data.get(_SQLTASK_RESULT_SET, "0")
-        conn_ref = sql_data.get(_ATTR_CONNECTION, "")
+        def _sql_attr(name: str) -> str:
+            # SQLTask-namespaced, bare, or child-element storage.
+            val = sql_data.get(f"{{{_SQL_TASK_NS}}}{name}") or sql_data.get(name)
+            if val is not None:
+                return val
+            for child in sql_data:
+                if isinstance(child.tag, str) and child.tag.rsplit("}", 1)[-1] == name:
+                    return (child.text or "").strip()
+            return ""
 
-        exe.sql = SqlStatement(original_text=sql_text.strip())
+        sql_text = _sql_attr("SqlStatementSource")
+        source_type = _sql_attr("SqlStatementSourceType") or "DirectInput"
+        result_raw = _sql_attr("ResultSet") or "0"
+        conn_ref = _sql_attr("Connection")
+
         exe.result_set = _RESULT_SET_MAP.get(result_raw, ResultSetType.NONE)
         exe.connection_ref = conn_ref or None
+
+        if source_type.lower() in ("variable", "fileconnection"):
+            # The "SQL" is actually a variable/connection NAME, resolved at
+            # runtime — transpiling it as SQL text would be silently wrong.
+            exe.sql = SqlStatement(
+                original_text="",
+                transpilation_notes=(
+                    f"SQL source is a {source_type} reference ({sql_text!r}) — "
+                    "statement text is resolved at runtime and cannot be "
+                    "statically transpiled"
+                ),
+            )
+            exe.conversion_notes = (
+                f"Execute SQL Task reads its statement from {source_type} "
+                f"{sql_text!r} — needs LLM/human to resolve the dynamic SQL"
+            )
+            return
+
+        exe.sql = SqlStatement(original_text=sql_text.strip())
+
+        # Parameter and result bindings — canonical completeness (the ?
+        # placeholders in the SQL map to these).
+        for child in sql_data.iter():
+            if not isinstance(child.tag, str):
+                continue
+            local = child.tag.rsplit("}", 1)[-1]
+            if local == "ParameterBinding":
+                exe.parameter_mappings.append({
+                    "kind": "parameter",
+                    "variable": child.get(f"{{{_SQL_TASK_NS}}}DtsVariableName")
+                                or child.get("DtsVariableName", ""),
+                    "name": child.get(f"{{{_SQL_TASK_NS}}}ParameterName")
+                            or child.get("ParameterName", ""),
+                    "direction": child.get(f"{{{_SQL_TASK_NS}}}ParameterDirection")
+                                 or child.get("ParameterDirection", "Input"),
+                })
+            elif local == "ResultBinding":
+                exe.parameter_mappings.append({
+                    "kind": "result",
+                    "variable": child.get(f"{{{_SQL_TASK_NS}}}DtsVariableName")
+                                or child.get("DtsVariableName", ""),
+                    "name": child.get(f"{{{_SQL_TASK_NS}}}ResultName")
+                            or child.get("ResultName", ""),
+                })
+
+    # Project files that hold source code (vs. binary VSTA project plumbing)
+    _SCRIPT_SOURCE_EXTS = (".cs", ".vb")
+    _SCRIPT_SKIP_EXTS = (".vsaproj", ".vsproj", ".csproj", ".vbproj", ".dll",
+                         ".myapp", ".resx", ".settings", ".datasource")
 
     def _populate_script_task(self, exe: ControlFlowExecutable, el: etree._Element) -> None:
         obj_data = el.find(DTS_OBJECT_DATA)
         if obj_data is None:
             return
-        # Script Task stores code inside a ProjectItem or BinaryCode element
+
+        sources: list[str] = []
         for child in obj_data.iter():
+            if not isinstance(child.tag, str):
+                continue
             local = etree.QName(child.tag).localname
-            if local in ("BinaryCode", "ScriptCode", "Code"):
-                exe.script_code = (child.text or "").strip() or None
+
+            if local == "ScriptProject":
+                # Modern (2008R2+) VSTA format: metadata on the project element.
+                lang = (child.get("Language") or "").lower()
+                if lang:
+                    exe.script_language = "vbnet" if "basic" in lang or "vb" in lang else "csharp"
+                ro = child.get("ReadOnlyVariables") or ""
+                rw = child.get("ReadWriteVariables") or ""
+                exe.read_only_variables = [v.strip() for v in ro.split(",") if v.strip()]
+                exe.read_write_variables = [v.strip() for v in rw.split(",") if v.strip()]
+
+            elif local == "ProjectItem":
+                item_name = (child.get("Name") or child.get("SourceName") or "").lower()
+                text = (child.text or "").strip()
+                if not text:
+                    continue
+                if item_name.endswith(self._SCRIPT_SKIP_EXTS):
+                    continue          # binary/VSTA plumbing, not business logic
+                if item_name.endswith(self._SCRIPT_SOURCE_EXTS) or _looks_like_code(text):
+                    header = f"// ─── {child.get('Name', 'ProjectItem')} ───\n" \
+                        if len(sources) or item_name else ""
+                    sources.append(header + text)
+                    if item_name.endswith(".vb"):
+                        exe.script_language = exe.script_language or "vbnet"
+
+            elif local in ("BinaryCode", "ScriptCode", "Code"):
+                # Legacy single-blob storage
+                text = (child.text or "").strip()
+                if text and _looks_like_code(text):
+                    sources.append(text)
+
             elif local == "ScriptLanguage":
                 lang_raw = (child.text or "").lower()
-                exe.script_language = "csharp" if "csharp" in lang_raw or "cs" in lang_raw else "vbnet"
+                exe.script_language = (
+                    "vbnet" if "basic" in lang_raw or "vb" in lang_raw else "csharp"
+                )
+
+        if sources:
+            exe.script_code = "\n\n".join(sources)
+        if exe.script_code and not exe.script_language:
+            exe.script_language = "csharp"
 
     def _populate_container(self, exe: ControlFlowExecutable, el: etree._Element) -> None:
         exe.children = self._extract_executables(el)
@@ -231,3 +337,20 @@ class ControlFlowExtractor:
 def _simplify_ref(ref: str) -> str:
     """Trim full refId path to just the task name portion."""
     return ref.split("\\")[-1] if ref else ref
+
+
+import re as _re
+
+_BASE64_RE = _re.compile(r"^[A-Za-z0-9+/=\s]+$")
+_CODE_HINT_RE = _re.compile(
+    r"\b(public|private|void|class|namespace|using|Sub|Function|Dim|Imports|Dts)\b"
+)
+
+
+def _looks_like_code(text: str) -> bool:
+    """Distinguish C#/VB source from base64-encoded binary project blobs."""
+    sample = text[:2000]
+    if _CODE_HINT_RE.search(sample):
+        return True
+    # A long unbroken base64-alphabet run with no code keywords is binary.
+    return not (_BASE64_RE.match(sample) and len(sample) > 40)
